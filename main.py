@@ -111,15 +111,23 @@ def generate_gcal_link(label: str, start_epoch: int, duration_seconds: int = 360
 # --- Helpers ---
 def parse_duration_string(input_str: str) -> int:
     if not input_str: return 0
-    input_str = input_str.strip().lower()
-    match = re.match(r"^(\d+)([mhd])$", input_str)
+    clean_str = input_str.strip().lower().replace(" ", "")
+    
+    # Check for plain number (default to minutes)
+    if clean_str.isdigit():
+        return int(clean_str) * 60
+        
+    # Extended Regex for m, min, mins, h, hr, hours, d, day, days
+    match = re.match(r"^(\d+)([a-z]+)$", clean_str)
     if match:
         val = int(match.group(1))
         unit = match.group(2)
-        if unit == 'm': return val * 60
-        elif unit == 'h': return val * 3600
-        elif unit == 'd': return val * 86400
-    raise ValueError("Invalid Duration. Use '10m', '2h', '1d'.")
+        
+        if unit in ['m', 'min', 'mins']: return val * 60
+        elif unit in ['h', 'hr', 'hour', 'hours']: return val * 3600
+        elif unit in ['d', 'day', 'days']: return val * 86400
+    
+    raise ValueError(f"Invalid Duration: '{input_str}'. Use '30m', '1h', or '1d'.")
 
 def parse_reminders_string(input_str: str) -> list:
     if not input_str: return []
