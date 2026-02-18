@@ -238,7 +238,15 @@ def get_next_sunday_from_now() -> int:
 # --- Discord Event Helpers ---
 async def create_discord_event(guild: discord.Guild, label: str, start_epoch: int, duration_seconds: int = 900):
     try:
+        now = datetime.now(timezone.utc)
         start_time = datetime.fromtimestamp(start_epoch, timezone.utc)
+        
+        # Discord validation: start_time must be in the future?
+        # Actually for "Active Now" events, we might need to handle differently.
+        # But if we strictly follow "Scheduled Event", it should be future.
+        if start_time <= now:
+            start_time = now + timedelta(seconds=5) # Buffer
+            
         possible_end = start_time + timedelta(seconds=duration_seconds)
         
         # Determine strict end time for Discord (must be after start)
@@ -975,12 +983,15 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                 repeat_icon = "🔄 " if timer.get("recurrence_seconds", 0) > 0 else ""
                 
                 owner = f"<@{timer['owner_id']}>"
+                role_tag = ""
+                if timer.get("role_id"):
+                    role_tag = f" <@&{timer['role_id']}>"
                 
                 if timer.get("type") == "foundry_job":
                      icon = "🔥"
                      description += f"> **{timer['label']}**\n> 🤖 Check: <t:{ts}:f> (<t:{ts}:R>)\n\n"
                 else:
-                     description += f"> **{timer['label']}** (by {owner}) {icon} {repeat_icon}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>)\n\n"
+                     description += f"> **{timer['label']}** (by {owner}){role_tag} {icon} {repeat_icon}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>)\n\n"
         
         embed.description = description
         embed.set_image(url=DUMMY_SPACER)
@@ -1654,7 +1665,7 @@ async def check_timers():
         for context_id_str, context_data in data.items():
             try:
                 g = bot.get_guild(int(context_id_str))
-                if g: await update_dashboard(g, context_data)
+                if g: await update_dashboard(g, context_data, resend=True)
             except: pass
 
 @check_timers.before_loop
