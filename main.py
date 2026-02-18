@@ -15,6 +15,29 @@ def create_default_context(purpose=ssl.Purpose.SERVER_AUTH, *, cafile=None, capa
 ssl.create_default_context = create_default_context
 # ---------------------------
 
+print("--- CHRONO CLOUDY STARTUP ---")
+
+# --- Health-Check Server (Render Keep-Alive) ---
+from aiohttp import web
+
+async def health_handler(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    try:
+        app = web.Application()
+        app.router.add_get("/health", health_handler)
+        app.router.add_get("/", health_handler)
+        port = int(os.environ.get("PORT", 8080))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"🌐 Health server running on port {port}")
+    except Exception as e:
+        print(f"❌ Failed to start health server: {e}") 
+# ---------------------------
+
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -43,7 +66,8 @@ class StratusBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        pass
+        # Start health check immediately, don't wait for Discord connection
+        await start_health_server()
 
 bot = StratusBot()
 
@@ -1628,25 +1652,9 @@ async def on_ready():
     await check_missed_events()
     if not check_timers.is_running(): check_timers.start()
 
-    # Start health-check web server for Render keep-alive
-    await start_health_server()
-
-# --- Health-Check Server (Render Keep-Alive) ---
-from aiohttp import web
-
-async def health_handler(request):
-    return web.Response(text="OK")
-
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/health", health_handler)
-    app.router.add_get("/", health_handler)
-    port = int(os.environ.get("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"🌐 Health server running on port {port}")
+    bot.add_view(DashboardView())
+    await check_missed_events()
+    if not check_timers.is_running(): check_timers.start()
 
 if __name__ == "__main__":
     bot.run(TOKEN)
