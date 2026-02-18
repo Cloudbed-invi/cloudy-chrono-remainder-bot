@@ -151,10 +151,9 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
         raise ValueError("Invalid Time. Use '10m', '14:00', or 'YYYY-MM-DD HH:MM'.")
 
     if mode == "duration":
-        try:
-            seconds = parse_duration_string(user_input)
-            return int((current_utc + timedelta(seconds=seconds)).timestamp())
-        except: raise ValueError("Invalid Duration.")
+        # Don't catch/mask here, let parse_duration_string error bubble up
+        seconds = parse_duration_string(user_input)
+        return int((current_utc + timedelta(seconds=seconds)).timestamp())
         
     elif mode == "utc_today":
         match = re.match(r"^(\d{1,2}):(\d{2})$", user_input)
@@ -1156,8 +1155,8 @@ async def timer_slash(interaction: discord.Interaction, label: str, time: str, r
     await interaction.response.defer(ephemeral=True)
     try:
         end_epoch = parse_time_input(time, "smart")
-    except ValueError:
-        await interaction.followup.send("❌ Invalid Time.", ephemeral=True)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
         return
     
     recurrence_seconds = 0
