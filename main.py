@@ -469,6 +469,10 @@ class ManageTimersSelect(discord.ui.Select):
         idx = int(self.values[0])
         self.view.selected_index = idx
         
+        # PERSIST SELECTION:
+        for option in self.options:
+            option.default = (option.value == self.values[0])
+
         # Enable Buttons
         for item in self.view.children:
             if isinstance(item, discord.ui.Button):
@@ -1008,6 +1012,13 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                 new_msg = await channel.send(embed=embed, view=view)
                 try: await new_msg.pin()
                 except: pass
+                # Clean up "Pinned a message" notification
+                try:
+                    async for sys_msg in channel.history(limit=5):
+                        if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == new_msg.id:
+                            await sys_msg.delete()
+                            break
+                except: pass
                 
                 data["dashboard_message_id"] = new_msg.id
                 # Correctly save the data
@@ -1045,7 +1056,13 @@ async def run_setup(guild, channel):
     
     view = DashboardView()
     message = await channel.send(embed=embed, view=view)
-    try: await message.pin()
+    try: 
+        await message.pin()
+        # Clean up Notification
+        async for sys_msg in channel.history(limit=5):
+             if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == message.id:
+                 await sys_msg.delete()
+                 break
     except: pass
 
     data[guild_id] = {
@@ -1269,7 +1286,13 @@ async def dashboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view)
     msg = await interaction.original_response()
     # Pin if possible (might fail in User App contexts, that's okay)
-    try: await msg.pin()
+    try: 
+        await msg.pin()
+        # Clean up Notification
+        async for sys_msg in interaction.channel.history(limit=5):
+             if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == msg.id:
+                 await sys_msg.delete()
+                 break
     except: pass
     
     # Save Location
