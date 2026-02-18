@@ -999,15 +999,12 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                 except: pass
                 
                 data["dashboard_message_id"] = new_msg.id
-                save_data(load_data().update({str(channel.guild.id): data})) # slightly unsafe save, rely on callers to save data usually
-                # Actually update_dashboard usually just updates the view, saving logic should handle ID updates if changed.
-                # Just saving specifically here:
+                # Correctly save the data
                 all_data = load_data()
-                # Find key?
-                # Assume passed data object is reference to dict inside all_data... not guaranteed.
-                # Re-fetch based on channel guild?
                 if isinstance(guild_or_user, discord.Guild):
+                    if str(guild_or_user.id) not in all_data: all_data[str(guild_or_user.id)] = {}
                     all_data[str(guild_or_user.id)]["dashboard_message_id"] = new_msg.id
+                    all_data[str(guild_or_user.id)]["dashboard_channel_id"] = channel.id # Ensure channel is synced too
                     save_data(all_data)
             except: pass
         else:
@@ -1048,6 +1045,33 @@ async def run_setup(guild, channel):
     return message.jump_url
 
 # --- Commands ---
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def refresh(ctx):
+    """Refreshes the dashboard by deleting the old one and sending a new one (Force Pin)."""
+    data = load_data()
+    guild_id = str(ctx.guild.id)
+    if guild_id in data:
+        await ctx.send("🔄 **Refreshing Dashboard...**")
+        await update_dashboard(ctx.guild, data[guild_id], resend=True)
+        # Delete the trigger command and confirmation to keep chat clean
+        try: await ctx.message.delete() 
+        except: pass
+    else:
+        await ctx.send("❌ No dashboard found. Use `!start` first.")
+
+@bot.tree.command(name="refresh", description="Force Refresh & Pin Dashboard")
+@app_commands.checks.has_permissions(administrator=True)
+async def refresh_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    data = load_data()
+    guild_id = str(interaction.guild_id)
+    if guild_id in data:
+        await update_dashboard(interaction.guild, data[guild_id], resend=True)
+        await interaction.followup.send("✅ **Dashboard Refreshed & Pinned!**", ephemeral=True)
+    else:
+        await interaction.followup.send("❌ No dashboard found. Use `/start` first.", ephemeral=True)
 
 @bot.command()
 async def sync(ctx):
@@ -1652,9 +1676,7 @@ async def on_ready():
     await check_missed_events()
     if not check_timers.is_running(): check_timers.start()
 
-    bot.add_view(DashboardView())
-    await check_missed_events()
-    if not check_timers.is_running(): check_timers.start()
+
 
 if __name__ == "__main__":
     bot.run(TOKEN)
