@@ -140,7 +140,7 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
              except: pass
         try: return parse_time_input(user_input, "duration")
         except: pass
-        raise ValueError("Could not parse time. Use '10m' or '14:00'.")
+        raise ValueError("Invalid Time. Use '10m', '14:00', or 'YYYY-MM-DD HH:MM'.")
 
     if mode == "duration":
         try:
@@ -169,11 +169,21 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
         raise ValueError("Invalid Format.")
 
     elif mode == "utc_custom":
-        try:
-            dt = datetime.strptime(user_input, "%Y-%m-%d %H:%M")
-            dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        except ValueError: raise ValueError("Invalid Format.")
+        formats = [
+            "%Y-%m-%d %H:%M",
+            "%Y/%m/%d %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%d-%m-%Y %H:%M",
+            "%d/%m/%Y %H:%M"
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(user_input, fmt)
+                dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp())
+            except ValueError: continue
+        raise ValueError("Invalid Format.")
     
     raise ValueError("Invalid time expression.")
 
@@ -553,7 +563,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         self.add_item(self.label_input)
         
         self.time_input = discord.ui.TextInput(
-            label="Time Until Alert", placeholder="10m or 14:00", default=default_time, min_length=2, max_length=20
+            label="Time Until Alert", placeholder="e.g. 10m, 14:00, or 2026-02-19 12:30", default=default_time, min_length=2, max_length=20
         )
         self.add_item(self.time_input)
 
