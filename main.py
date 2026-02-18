@@ -111,23 +111,33 @@ def generate_gcal_link(label: str, start_epoch: int, duration_seconds: int = 360
 # --- Helpers ---
 def parse_duration_string(input_str: str) -> int:
     if not input_str: return 0
-    clean_str = input_str.strip().lower().replace(" ", "")
+    clean_str = input_str.strip().lower()
     
     # Check for plain number (default to minutes)
     if clean_str.isdigit():
         return int(clean_str) * 60
         
-    # Extended Regex for m, min, mins, h, hr, hours, d, day, days
-    match = re.match(r"^(\d+)([a-z]+)$", clean_str)
-    if match:
-        val = int(match.group(1))
-        unit = match.group(2)
-        
-        if unit in ['m', 'min', 'mins']: return val * 60
-        elif unit in ['h', 'hr', 'hour', 'hours']: return val * 3600
-        elif unit in ['d', 'day', 'days']: return val * 86400
+    # Composite Parser (e.g. "47h 30m", "1d 2h")
+    # Finds all pairs of (number, unit)
+    matches = re.findall(r"(\d+)\s*([a-z]+)", clean_str)
     
-    raise ValueError(f"Invalid Duration: '{input_str}'. Use '30m', '1h', or '1d'.")
+    if not matches:
+        # No units found, and wasn't a plain number.
+        raise ValueError(f"Invalid Duration: '{input_str}'. Use '30m', '1h', '1d', or '1h 30m'.")
+        
+    total_seconds = 0
+    valid_units = ['m', 'min', 'mins', 'h', 'hr', 'hour', 'hours', 'd', 'day', 'days']
+    
+    for val_str, unit in matches:
+        if unit not in valid_units:
+             raise ValueError(f"Invalid Unit: '{unit}' in '{input_str}'.")
+             
+        val = int(val_str)
+        if unit in ['m', 'min', 'mins']: total_seconds += val * 60
+        elif unit in ['h', 'hr', 'hour', 'hours']: total_seconds += val * 3600
+        elif unit in ['d', 'day', 'days']: total_seconds += val * 86400
+
+    return total_seconds
 
 def parse_reminders_string(input_str: str) -> list:
     if not input_str: return []
