@@ -1274,7 +1274,7 @@ async def dashboard(interaction: discord.Interaction):
     
     # Save Location
     data[context_id]["dashboard_channel_id"] = interaction.channel_id
-    data[context_id]["dashboard_msg_id"] = msg.id
+    data[context_id]["dashboard_message_id"] = msg.id
     save_data(data)
     
     # Force Update (if guild)
