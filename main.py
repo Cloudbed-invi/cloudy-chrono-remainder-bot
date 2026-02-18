@@ -1013,9 +1013,11 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                 # Correctly save the data
                 all_data = load_data()
                 if isinstance(guild_or_user, discord.Guild):
-                    if str(guild_or_user.id) not in all_data: all_data[str(guild_or_user.id)] = {}
+                    # CRITICAL FIX: Update the DB object with our CURRENT fresh data (including new timers)
+                    # before saving. Otherwise, loading stale data overwrites our new timers.
+                    all_data[str(guild_or_user.id)] = data 
                     all_data[str(guild_or_user.id)]["dashboard_message_id"] = new_msg.id
-                    all_data[str(guild_or_user.id)]["dashboard_channel_id"] = channel.id # Ensure channel is synced too
+                    all_data[str(guild_or_user.id)]["dashboard_channel_id"] = channel.id
                     save_data(all_data)
             except: pass
         else:
