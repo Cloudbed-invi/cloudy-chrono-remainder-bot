@@ -875,8 +875,6 @@ class TimerWizardView(discord.ui.View):
             return
 
         elif self.template == "Arena":
-            
-        elif self.template == "Arena":
              # Next 23:55 UTC
              now = datetime.now(timezone.utc)
              target = now.replace(hour=23, minute=55, second=0, microsecond=0)
