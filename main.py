@@ -672,7 +672,7 @@ class TimerWizardView(discord.ui.View):
         super().__init__(timeout=300)
         self.template = "Custom"
         self.mode = "duration"
-        self.notify_method = "📢 Message in Server (Ping Role)"
+        self.notify_method = "⚠️ Message in Server (Ping @everyone)" # Changed default
         self.role_id = None
         self.foundry_lead = None 
         self.is_dm = is_dm
@@ -702,7 +702,7 @@ class TimerWizardView(discord.ui.View):
              discord.SelectOption(label="Arena Reset", description="Daily (23:55 UTC)", emoji="🛡️", value="Arena"),
              discord.SelectOption(label="🐻 Bear Trap", description="Alliance Event (30m)", emoji="🐻", value="Bear"),
              discord.SelectOption(label="🤡 Crazy Joe", description="Defense Waves (40m)", emoji="🤡", value="Joe"),
-             discord.SelectOption(label="Foundry Auto", description="Auto-DM Lead on Thursday", emoji="🔥", value="Foundry"),
+             discord.SelectOption(label="Foundry Auto", description="Auto-DM Lead on Friday", emoji="🔥", value="Foundry"),
          ], row=0
      )
     async def select_template(self, interaction: discord.Interaction, select: discord.ui.Select):
@@ -755,8 +755,8 @@ class TimerWizardView(discord.ui.View):
     @discord.ui.select(
         placeholder="Notification Mode...",
         options=[
-            discord.SelectOption(label="📢 Message in Server (Ping Role)", default=True),
-            discord.SelectOption(label="⚠️ Message in Server (Ping @everyone)"),
+            discord.SelectOption(label="📢 Message in Server (Ping Role)"),
+            discord.SelectOption(label="⚠️ Message in Server (Ping @everyone)", default=True),
             discord.SelectOption(label="🔕 Message in Server (Silent)"),
             discord.SelectOption(label="📩 DM Me"),
         ], row=2
