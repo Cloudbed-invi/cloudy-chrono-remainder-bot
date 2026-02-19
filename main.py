@@ -619,10 +619,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         )
         self.add_item(self.desc_input)
         
-        self.image_input = discord.ui.TextInput(
-            label="Image/GIF URL (Optional)", placeholder="e.g. Tenor Link", required=False, max_length=200
-        )
-        self.add_item(self.image_input)
+        # NOTE: Reduced to 5 inputs (Discord Limit) - Removed Image Input
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -659,7 +656,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
             self.notify_method, 
             self.mode, # Store original mode
             recurrence_seconds, 
-            self.image_input.value.strip() or None,
+            None, # Image URL removed from Modal due to limit
             event_duration=event_duration,
             reminders=reminders,
             description=self.desc_input.value.strip() or None
