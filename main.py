@@ -242,14 +242,14 @@ def get_next_cycle(start_year: int, start_month: int, start_day: int, hour: int 
     
     return int(next_date.timestamp())
 
-def get_next_foundry_thursday() -> int:
-    """Returns next Thursday 00:00 UTC."""
+def get_next_foundry_target() -> int:
+    """Returns next Friday 00:00 UTC (Time Selection Phase)."""
     now = datetime.now(timezone.utc)
-    days_ahead = (3 - now.weekday()) % 7 # Thursday is 3
-    if days_ahead == 0 and now.hour > 0: days_ahead = 7
+    days_ahead = (4 - now.weekday()) % 7 # Friday is 4
+    if days_ahead == 0 and now.hour > 20: # If it's Friday night, go to next week
+         days_ahead = 7
     
-    target = now + timedelta(days=days_ahead)
-    target = target.replace(hour=0, minute=0, second=0, microsecond=0)
+    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
     return int(target.timestamp())
 
 def get_next_sunday_from_now() -> int:
@@ -263,7 +263,7 @@ def get_next_sunday_from_now() -> int:
     return int(target.timestamp())
 
 # --- Discord Event Helpers ---
-async def create_discord_event(guild: discord.Guild, label: str, start_epoch: int, duration_seconds: int = 900):
+async def create_discord_event(guild: discord.Guild, label: str, start_epoch: int, duration_seconds: int = 900, description: str = None):
     try:
         now = datetime.now(timezone.utc)
         start_time = datetime.fromtimestamp(start_epoch, timezone.utc)
@@ -287,7 +287,7 @@ async def create_discord_event(guild: discord.Guild, label: str, start_epoch: in
             end_time=end_time,
             entity_type=discord.EntityType.external,
             location="Chrono Dashboard",
-            description="Timer managed by Chrono Cloudy.",
+            description=description or "Timer managed by Chrono Cloudy.",
             privacy_level=discord.PrivacyLevel.guild_only
         )
         logger.info(f"✅ Discord Event Created: {event.id} for '{label}'")
@@ -613,6 +613,11 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
              label="Duration | Reminder (Optional)", placeholder="1h | 10m, 5m", default=def_adv, required=False, max_length=50
         )
         self.add_item(self.adv_input)
+
+        self.desc_input = discord.ui.TextInput(
+             label="Details / Message (Optional)", placeholder="e.g. Gather at Hive!", required=False, max_length=200, style=discord.TextStyle.long
+        )
+        self.add_item(self.desc_input)
         
         self.image_input = discord.ui.TextInput(
             label="Image/GIF URL (Optional)", placeholder="e.g. Tenor Link", required=False, max_length=200
@@ -624,8 +629,13 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         event_duration = 0
         reminders = []
         try:
-            # Fix: Always use 'smart' mode to handle mixed inputs (e.g. 5m OR 2026-02-12)
-            end_epoch = parse_time_input(self.time_input.value, "smart")
+            # Fix: Use self.mode if specific, otherwise fall back to smart
+            # logic: if user picked "UTC Today", force that mode. If "duration", force that.
+            # "smart" is not a dropdown option, but passed for "Custom" maybe? 
+            # Check TimerWizardView.select_mode: options are duration, utc_today, utc_tomorrow, utc_custom
+            parse_mode = self.mode if self.mode in ["utc_today", "utc_tomorrow", "duration", "utc_custom"] else "smart"
+            end_epoch = parse_time_input(self.time_input.value, parse_mode)
+            
             recurrence_val = self.recur_input.value.strip()
             recurrence_seconds = 0
             if recurrence_val: recurrence_seconds = parse_duration_string(recurrence_val)
@@ -641,10 +651,19 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
             await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
             return
 
-        label = self.label_input.value
-        image_url = self.image_input.value.strip() or None
-        
-        await add_timer(interaction, label, end_epoch, self.role_id, self.notify_method, self.mode, recurrence_seconds, image_url, event_duration, reminders)
+        await add_timer(
+            interaction, 
+            self.label_input.value, 
+            end_epoch, 
+            self.role_id, 
+            self.notify_method, 
+            self.mode, # Store original mode
+            recurrence_seconds, 
+            self.image_input.value.strip() or None,
+            event_duration=event_duration,
+            reminders=reminders,
+            description=self.desc_input.value.strip() or None
+        )
         try: await interaction.message.edit(content="✅ **Configuration Saved**", view=None)
         except: pass
 
@@ -798,7 +817,7 @@ class TimerWizardView(discord.ui.View):
                 return
 
             label = f"🔥 Foundry Automation (Lead: {self.foundry_lead.mention})"
-            end_epoch = get_next_foundry_thursday()
+            end_epoch = get_next_foundry_target()
             
             new_job = {
                 "label": label,
@@ -825,25 +844,37 @@ class TimerWizardView(discord.ui.View):
         def_time = None
         
         # Template Logic
+        # Template Logic
         if self.template == "Test Template":
             def_label = "Test Event"
             def_time = "1m"
             
-        elif self.template == "Internal":
-            # Reference: Feb 14, 2026 12:00 UTC
-            next_ts = get_next_cycle(2026, 2, 14, 12)
-            dt = datetime.fromtimestamp(next_ts, timezone.utc)
-            def_label = "Internal Castle [Battle]"
-            def_time = dt.strftime("%Y-%m-%d %H:%M")
-            # Pre-fill modal isn't possible directly for all fields in easy way without custom modal
-            # But we can pass these to the modal constructor to pre-fill
+        elif self.template in ["Internal", "SvS"]:
+            # Auto-Create Logic (Skip Modal)
+            is_internal = (self.template == "Internal")
+            ref_day = 14 if is_internal else 28
+            label_prefix = "Internal Castle [Battle]" if is_internal else "SvS Castle Battle"
             
-        elif self.template == "SvS":
-            # Reference: Feb 28, 2026 12:00 UTC
-            next_ts = get_next_cycle(2026, 2, 28, 12)
-            dt = datetime.fromtimestamp(next_ts, timezone.utc)
-            def_label = "SvS Castle Battle"
-            def_time = dt.strftime("%Y-%m-%d %H:%M")
+            # Calculate next occurrence
+            next_ts = get_next_cycle(2026, 2, ref_day, 12)
+            
+            await interaction.response.defer(ephemeral=True)
+            await add_timer(
+                interaction, 
+                label_prefix, 
+                next_ts, 
+                self.role_id, 
+                self.notify_method, 
+                "utc_today", # Mode is technically calculated, but we use this for internal consistency
+                recurrence_seconds=2419200, # 28 days (4 weeks)
+                reminders=[18000, 7200, 3600], # 5h, 2h, 1h reminders (approx)
+                description="Auto-scheduled based on 4-week cycle."
+            )
+            try: await interaction.message.edit(content=f"✅ **{label_prefix}** Scheduled!", view=None)
+            except: pass
+            return
+
+        elif self.template == "Arena":
             
         elif self.template == "Arena":
              # Next 23:55 UTC
@@ -855,15 +886,16 @@ class TimerWizardView(discord.ui.View):
              
         elif self.template == "Bear":
              def_label = "🐻 Bear Trap"
-             def_time = "10m" # Usually set just before opening
+             # def_time left blank
              
         elif self.template == "Joe":
              def_label = "🤡 Crazy Joe"
-             def_time = "10m"
+             # def_time left blank
 
-        if self.mode == "duration" or self.template == "Foundry": pass # Foundry handled above
+        if self.mode == "duration" or self.template == "Foundry": pass 
         else:
-            def_time = def_time or "10m"
+            # Keep blank if not set above
+            pass 
             
         modal = TimerDetailsModal(
             self.mode, self.notify_method, self.role_id, 
@@ -906,7 +938,7 @@ class DashboardView(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # --- Core Logic ---
-async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int, role_id: int, notify_method: str, mode: str, recurrence_seconds: int = 0, image_url: str = None, event_duration: int = 900, reminders: list = None):
+async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int, role_id: int, notify_method: str, mode: str, recurrence_seconds: int = 0, image_url: str = None, event_duration: int = 900, reminders: list = None, description: str = None):
     # Context ID (Guild OR User)
     context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
     is_dm = interaction.guild is None
@@ -918,7 +950,7 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
     # Create Discord Event (Only if Guild)
     discord_event_id = None
     if not is_dm and mode != "silent":
-         discord_event_id = await create_discord_event(interaction.guild, label, end_epoch, event_duration)
+         discord_event_id = await create_discord_event(interaction.guild, label, end_epoch, event_duration, description=description)
     
     # Save Timer
     new_timer = {
@@ -934,7 +966,8 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
         "discord_event_id": discord_event_id,
         "event_duration": event_duration,
         "reminders": reminders or [],
-        "sent_reminders": []
+        "sent_reminders": [],
+        "description": description
     }
     
     data[context_id]["timers"].append(new_timer)
@@ -1022,7 +1055,11 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                      icon = "🔥"
                      description += f"> **{timer['label']}**\n> 🤖 Check: <t:{ts}:f> (<t:{ts}:R>)\n\n"
                 else:
-                     description += f"> **{timer['label']}** (by {owner}){role_tag} {icon} {repeat_icon}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>)\n\n"
+                     details = ""
+                     if timer.get("description"):
+                         details = f"\n> 📝 *{timer['description']}*"
+                         
+                     description += f"> **{timer['label']}** (by {owner}){role_tag} {icon} {repeat_icon}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>){details}\n\n"
         
         embed.description = description
         embed.set_image(url=DUMMY_SPACER)
