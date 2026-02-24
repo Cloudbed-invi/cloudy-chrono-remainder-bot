@@ -46,34 +46,26 @@ def create_dice_frame(number):
         draw_dot(dot)
     return img
 
-def create_animated_dice(final_number):
+def generate_assets():
     os.makedirs('assets', exist_ok=True)
-    frames = []
     
-    # Generate 10 random frames for the "rolling" effect
-    for _ in range(8):
-        # 1-6 at random, or a blank "motion blur" 0
-        n = random.randint(1, 6)
-        frames.append(create_dice_frame(n).convert("RGB"))
+    # 1. Generate Static PNGs for the final results
+    for i in range(1, 7):
+        img = create_dice_frame(i).convert("RGB")
+        img.save(f'assets/dice_{i}.png')
         
-    # Final Frame
-    final_frame = create_dice_frame(final_number).convert("RGB")
-    
-    # Discord loops GIF forever by default but we can set duration.
-    # durations: fast for rolling (e.g., 50ms), stay on final for 2000ms.
-    # To stop looping, loop=1 (which actually means 1 loop / play once according to some clients, though Discord sometimes loops indefinitely regardless).
-    durations = [100] * len(frames) + [5000] 
-    frames.append(final_frame)
+    # 2. Generate a single continuous looping GIF for the "Rolling" phase
+    rolling_sequence = [1, 5, 2, 6, 3, 4, 1, 6, 2, 5]
+    frames = [create_dice_frame(n).convert("RGB") for n in rolling_sequence]
     
     frames[0].save(
-        f'assets/dice_{final_number}.gif',
+        'assets/rolling.gif',
         save_all=True,
         append_images=frames[1:],
-        duration=durations,
+        duration=100, # 100ms per frame
         loop=0 # 0 means infinite loop
     )
 
 if __name__ == '__main__':
-    for i in range(1, 7):
-        create_animated_dice(i)
-    print("Dice animated GIFs generated successfully.")
+    generate_assets()
+    print("Dice PNGs and rolling.gif generated successfully.")

@@ -1396,6 +1396,17 @@ async def shutdown_cmd(ctx):
     await ctx.send("🛑 **Shutdown Initiated.**")
     await bot.close()
 
+@bot.command(name="syncglobal")
+@commands.has_permissions(administrator=True)
+async def sync_global(ctx):
+    """Admin command to force a global slash command sync (for DMs)"""
+    msg = await ctx.send("🔄 Syncing global slash commands... (This might take a moment)")
+    try:
+        synced = await bot.tree.sync()
+        await msg.edit(content=f"✅ Successfully synced {len(synced)} global commands! They should now appear in DMs.")
+    except Exception as e:
+        await msg.edit(content=f"❌ Failed to sync: {e}")
+
 async def check_missed_events():
     logger.info("Checking for missed events...")
     data = load_data()
@@ -1506,31 +1517,80 @@ async def dice_slash(interaction: discord.Interaction):
     import asyncio
     
     roll = random.randint(1, 6)
-    file_path = f"assets/dice_{roll}.gif"
+    file_path = f"assets/dice_{roll}.png"
+    rolling_path = "assets/rolling.gif"
     
-    if os.path.exists(file_path):
-        # Initial Embed (Hidden Result)
-        embed_rolling = discord.Embed(title="🎲 Dice Roll", description=f"Rolling...", color=discord.Color.dark_gray())
+    if os.path.exists(file_path) and os.path.exists(rolling_path):
+        # 1. Send the generic looping rolling GIF first
+        embed_rolling = discord.Embed(title="🎲 Dice Roll", description="Rolling...", color=discord.Color.dark_gray())
+        file_roll = discord.File(rolling_path, filename="rolling.gif")
+        embed_rolling.set_thumbnail(url="attachment://rolling.gif")
         
-        # Send GIF but hide text first
-        file = discord.File(file_path, filename="dice.gif")
-        embed_rolling.set_thumbnail(url="attachment://dice.gif")
+        await interaction.response.send_message(embed=embed_rolling, file=file_roll)
         
-        await interaction.response.send_message(embed=embed_rolling, file=file)
+        # 2. Wait for the roll animation
+        # Increased to 1.8s for better suspense + network buffer
+        await asyncio.sleep(1.8)
         
-        # Wait for animation to finish (Generate DICE GIF takes roughly 8 * 100ms = 800ms)
-        await asyncio.sleep(1.2)
-        
-        # Edit to reveal result
+        # 3. Edit the message: Swap the GIF out for a STATIC PNG result.
+        # This completely avoids the 'stuttering GIF' discord UI bug!
         embed_result = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
-        embed_result.set_thumbnail(url="attachment://dice.gif") # Keep the attachment reference
+        file_result = discord.File(file_path, filename="dice.png")
+        embed_result.set_thumbnail(url="attachment://dice.png")
         
-        await interaction.edit_original_response(embed=embed_result)
+        await interaction.edit_original_response(embed=embed_result, attachments=[file_result])
         
     else:
-        # Fallback if GIF missing
+        # Fallback if images missing
         embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
         await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="rps", description="Roll a random Rock, Paper, Scissors hand!")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def rps_slash(interaction: discord.Interaction):
+    import random
+    import os
+    import asyncio
+    
+    # Determine bot choice
+    options = ["rock", "paper", "scissors"]
+    bot_choice = random.choice(options)
+    
+    file_path = f"assets/rps_{bot_choice}.png"
+    rolling_path = "assets/rps_roll.gif"
+    
+    if os.path.exists(file_path) and os.path.exists(rolling_path):
+        # 1. Send the looping "choosing..." GIF
+        embed_rolling = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description="Choosing...", color=discord.Color.dark_gray())
+        
+        # We must assign the file to a variable first so we can reuse the filename in the attachment URL.
+        # discord.File prevents reusing the same object twice, so we just use the name for the embed.
+        file_roll = discord.File(rolling_path, filename="rps_roll.gif")
+        embed_rolling.set_thumbnail(url="attachment://rps_roll.gif")
+        
+        await interaction.response.send_message(
+            embed=embed_rolling, 
+            file=file_roll
+        )
+        
+        # 2. Add suspense
+        await asyncio.sleep(1.8)
+        
+        # 3. Swap to Static outcome
+        result_text = f"Rolled **{bot_choice.title()}**!"
+        color = discord.Color.blue()
+        
+        embed_result = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description=result_text, color=color)
+        file_result = discord.File(file_path, filename="rps.png")
+        embed_result.set_thumbnail(url="attachment://rps.png")
+        
+        await interaction.edit_original_response(
+            embed=embed_result, 
+            attachments=[file_result]
+        )
+    else:
+        await interaction.response.send_message("Missing RPS image assets!", ephemeral=True)
 
 @bot.event
 async def on_message(message):
