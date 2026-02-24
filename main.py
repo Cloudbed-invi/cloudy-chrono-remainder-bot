@@ -1497,6 +1497,25 @@ async def check_missed_events():
             save_data(data)
             if guild: await update_dashboard(guild, context_data)
 
+@bot.tree.command(name="dice", description="Roll a 6-sided dice")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def dice_slash(interaction: discord.Interaction):
+    import random
+    import os
+    
+    roll = random.randint(1, 6)
+    file_path = f"assets/dice_{roll}.png"
+    
+    embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
+    
+    if os.path.exists(file_path):
+        file = discord.File(file_path, filename="dice.png")
+        embed.set_thumbnail(url="attachment://dice.png")
+        await interaction.response.send_message(embed=embed, file=file)
+    else:
+        await interaction.response.send_message(embed=embed)
+
 @bot.event
 async def on_message(message):
     if message.author.bot: return
