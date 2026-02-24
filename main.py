@@ -1498,22 +1498,38 @@ async def check_missed_events():
             if guild: await update_dashboard(guild, context_data)
 
 @bot.tree.command(name="dice", description="Roll a 6-sided dice")
-@app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.integration_types(guild=True, user=True)
 async def dice_slash(interaction: discord.Interaction):
     import random
     import os
+    import asyncio
     
     roll = random.randint(1, 6)
     file_path = f"assets/dice_{roll}.gif"
     
-    embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
-    
     if os.path.exists(file_path):
+        # Initial Embed (Hidden Result)
+        embed_rolling = discord.Embed(title="🎲 Dice Roll", description=f"Rolling...", color=discord.Color.dark_gray())
+        
+        # Send GIF but hide text first
         file = discord.File(file_path, filename="dice.gif")
-        embed.set_thumbnail(url="attachment://dice.gif")
-        await interaction.response.send_message(embed=embed, file=file)
+        embed_rolling.set_thumbnail(url="attachment://dice.gif")
+        
+        await interaction.response.send_message(embed=embed_rolling, file=file)
+        
+        # Wait for animation to finish (Generate DICE GIF takes roughly 8 * 100ms = 800ms)
+        await asyncio.sleep(1.2)
+        
+        # Edit to reveal result
+        embed_result = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
+        embed_result.set_thumbnail(url="attachment://dice.gif") # Keep the attachment reference
+        
+        await interaction.edit_original_response(embed=embed_result)
+        
     else:
+        # Fallback if GIF missing
+        embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
         await interaction.response.send_message(embed=embed)
 
 @bot.event
