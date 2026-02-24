@@ -1505,13 +1505,13 @@ async def dice_slash(interaction: discord.Interaction):
     import os
     
     roll = random.randint(1, 6)
-    file_path = f"assets/dice_{roll}.png"
+    file_path = f"assets/dice_{roll}.gif"
     
     embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
     
     if os.path.exists(file_path):
-        file = discord.File(file_path, filename="dice.png")
-        embed.set_thumbnail(url="attachment://dice.png")
+        file = discord.File(file_path, filename="dice.gif")
+        embed.set_thumbnail(url="attachment://dice.gif")
         await interaction.response.send_message(embed=embed, file=file)
     else:
         await interaction.response.send_message(embed=embed)
