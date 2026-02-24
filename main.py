@@ -68,6 +68,9 @@ class StratusBot(commands.Bot):
     async def setup_hook(self):
         # Start health check immediately, don't wait for Discord connection
         await start_health_server()
+        
+        # Register Persistent Views
+        self.add_view(RPSView())
 
 bot = StratusBot()
 
@@ -243,14 +246,30 @@ def get_next_cycle(start_year: int, start_month: int, start_day: int, hour: int 
     return int(next_date.timestamp())
 
 def get_next_foundry_target() -> int:
-    """Returns next Friday 00:00 UTC (Time Selection Phase)."""
+    """Returns next Wednesday 00:00 UTC (Time Selection Phase) for a 14-day cycle.
+    Based on the rule that the week of Feb 23, 2026 (Wed Feb 25) is an OFF week,
+    meaning the next active Wednesday is March 4, 2026."""
     now = datetime.now(timezone.utc)
-    days_ahead = (4 - now.weekday()) % 7 # Friday is 4
-    if days_ahead == 0 and now.hour > 20: # If it's Friday night, go to next week
+    
+    # 1. Find the upcoming Wednesday (Weekday 2 is Wednesday)
+    days_ahead = (2 - now.weekday()) % 7
+    if days_ahead == 0 and now.hour > 20: 
          days_ahead = 7
     
-    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
-    return int(target.timestamp())
+    target_wed = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    
+    # 2. Determine if this Wednesday is an "On" or "Off" week.
+    # Known ON week Wednesday: March 4, 2026 UTC
+    reference_wed = datetime(2026, 3, 4, tzinfo=timezone.utc)
+    
+    # Calculate days difference between our target Wednesday and the reference date
+    days_diff = (target_wed - reference_wed).days
+    
+    # If the difference is not a multiple of 14, it's an OFF week, so add 7 days to get to the ON week
+    if days_diff % 14 != 0:
+        target_wed += timedelta(days=7)
+        
+    return int(target_wed.timestamp())
 
 def get_next_sunday_from_now() -> int:
     """Returns next Sunday relative to now."""
@@ -699,7 +718,7 @@ class TimerWizardView(discord.ui.View):
              discord.SelectOption(label="Arena Reset", description="Daily (23:55 UTC)", emoji="🛡️", value="Arena"),
              discord.SelectOption(label="🐻 Bear Trap", description="Alliance Event (30m)", emoji="🐻", value="Bear"),
              discord.SelectOption(label="🤡 Crazy Joe", description="Defense Waves (40m)", emoji="🤡", value="Joe"),
-             discord.SelectOption(label="Foundry Auto", description="Auto-DM Lead on Friday", emoji="🔥", value="Foundry"),
+             discord.SelectOption(label="Foundry Auto", description="Auto-DM Lead on Wednesday (Bi-weekly)", emoji="🔥", value="Foundry"),
          ], row=0
      )
     async def select_template(self, interaction: discord.Interaction, select: discord.ui.Select):
@@ -834,7 +853,7 @@ class TimerWizardView(discord.ui.View):
             data[guild_id]["timers"].sort(key=lambda x: x["end_epoch"])
             save_data(data)
             await update_dashboard(interaction.guild, data[guild_id], resend=True)
-            await interaction.followup.send(f"✅ **Foundry Automation Active!**\nI will DM {self.foundry_lead.mention} every Thursday.", ephemeral=True)
+            await interaction.followup.send(f"✅ **Foundry Automation Active!**\nI will DM {self.foundry_lead.mention} every other Wednesday.", ephemeral=True)
             return
 
         def_label = None
@@ -1545,10 +1564,15 @@ async def dice_slash(interaction: discord.Interaction):
         embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
         await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="rps", description="Roll a random Rock, Paper, Scissors hand!")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def rps_slash(interaction: discord.Interaction):
+class RPSView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="Play Again", style=discord.ButtonStyle.primary, custom_id="rps_play_again_btn", emoji="🔁")
+    async def play_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await execute_rps(interaction)
+
+async def execute_rps(interaction: discord.Interaction):
     import random
     import os
     import asyncio
@@ -1563,17 +1587,36 @@ async def rps_slash(interaction: discord.Interaction):
     if os.path.exists(file_path) and os.path.exists(rolling_path):
         # 1. Send the looping "choosing..." GIF
         embed_rolling = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description="Choosing...", color=discord.Color.dark_gray())
-        
-        # We must assign the file to a variable first so we can reuse the filename in the attachment URL.
-        # discord.File prevents reusing the same object twice, so we just use the name for the embed.
         file_roll = discord.File(rolling_path, filename="rps_roll.gif")
         embed_rolling.set_thumbnail(url="attachment://rps_roll.gif")
         
-        await interaction.response.send_message(
-            embed=embed_rolling, 
-            file=file_roll
-        )
-        
+        # Determine if we are responding to a slash command or a button
+        if interaction.type == discord.InteractionType.application_command:
+            await interaction.response.defer(thinking=True)
+            msg_interaction = await interaction.followup.send(embed=embed_rolling, file=file_roll, wait=True)
+        else:
+            # We are responding to a button click
+            # Remove the button from the old message so only one "Play Again" button exists
+            await interaction.response.edit_message(view=None)
+            content_str = f"{interaction.user.mention} rolled!"
+            try:
+                # Send natively to channel to avoid Discord's visual "reply" tagging link
+                msg_interaction = await interaction.channel.send(
+                    content=content_str, 
+                    embed=embed_rolling, 
+                    file=file_roll
+                )
+            except discord.Forbidden:
+                # Fallback for user-apps without channel send permissions
+                # Re-instantiate file since it was closed by the failed request above
+                file_roll = discord.File(rolling_path, filename="rps_roll.gif")
+                msg_interaction = await interaction.followup.send(
+                    content=content_str, 
+                    embed=embed_rolling, 
+                    file=file_roll,
+                    wait=True
+                )
+            
         # 2. Add suspense
         await asyncio.sleep(1.8)
         
@@ -1585,12 +1628,33 @@ async def rps_slash(interaction: discord.Interaction):
         file_result = discord.File(file_path, filename="rps.png")
         embed_result.set_thumbnail(url="attachment://rps.png")
         
-        await interaction.edit_original_response(
-            embed=embed_result, 
-            attachments=[file_result]
-        )
+        view = RPSView()
+        
+        try:
+            if interaction.type == discord.InteractionType.application_command:
+                await interaction.edit_original_response(
+                    embed=embed_result, 
+                    attachments=[file_result],
+                    view=view
+                )
+            else:
+                # If it was a followup from a button click, we edit the message itself
+                await msg_interaction.edit(
+                    embed=embed_result, 
+                    attachments=[file_result],
+                    view=view
+                )
+        except discord.NotFound:
+            pass # Message might have been deleted by user during the wait
     else:
-        await interaction.response.send_message("Missing RPS image assets!", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Missing RPS image assets!", ephemeral=True)
+
+@bot.tree.command(name="rps", description="Roll a random Rock, Paper, Scissors hand!")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def rps_slash(interaction: discord.Interaction):
+    await execute_rps(interaction)
 
 @bot.event
 async def on_message(message):
@@ -1602,22 +1666,36 @@ async def on_message(message):
             state = user_foundry_state[message.author.id]
             step = state["step"]
             
-            if step == "awaiting_time":
-                # Parse Time
+            if step == "awaiting_l1_time":
+                # Parse Legion 1 Time
                 content = message.content.lower().strip()
-                # Find number
                 match = re.search(r"\d{1,2}", content)
                 if match:
                     hour = int(match.group(0))
                     if 0 <= hour <= 23:
-                         # confirm
-                         user_foundry_state[message.author.id]["temp_hours"] = [hour]
-                         user_foundry_state[message.author.id]["step"] = "awaiting_confirm"
-                         await message.channel.send(f"Found Sunday @ **{hour}:00 UTC**. Is this correct? (Reply **Yes** or **No**)")
+                         user_foundry_state[message.author.id]["l1_time"] = hour
+                         user_foundry_state[message.author.id]["step"] = "awaiting_l2_time"
+                         await message.channel.send("Got it. Now, what is the **Legion 2 time in UTC**? (Reply with the hour, e.g., '14' or '19')")
                     else:
-                         await message.channel.send("❌ Invalid hour (0-23). Try again (e.g. '14').")
+                         await message.channel.send("❌ Invalid hour (0-23). Try again (e.g., '14').")
                 else:
-                     await message.channel.send("❌ I didn't see an hour. Try again (e.g. '14').")
+                     await message.channel.send("❌ I didn't see an hour. Try again (e.g., '14').")
+            
+            elif step == "awaiting_l2_time":
+                # Parse Legion 2 Time
+                content = message.content.lower().strip()
+                match = re.search(r"\d{1,2}", content)
+                if match:
+                    hour = int(match.group(0))
+                    if 0 <= hour <= 23:
+                         l1_time = user_foundry_state[message.author.id]["l1_time"]
+                         user_foundry_state[message.author.id]["temp_hours"] = [l1_time, hour]
+                         user_foundry_state[message.author.id]["step"] = "awaiting_confirm"
+                         await message.channel.send(f"Are you sure your **Legion 1** time is **{l1_time}:00 UTC** and **Legion 2** time is **{hour}:00 UTC**? (Reply **Yes** or **No**, if no let's restart)")
+                    else:
+                         await message.channel.send("❌ Invalid hour (0-23). Try again (e.g., '14').")
+                else:
+                     await message.channel.send("❌ I didn't see an hour. Try again (e.g., '14').")
             
             elif step == "awaiting_confirm":
                 if "yes" in message.content.lower():
@@ -1635,13 +1713,10 @@ async def on_message(message):
                             target = sun_dt.replace(hour=h)
                             ts = int(target.timestamp())
                             
-                            # Prep (-1h)
-                            prep_ts = ts - 3600
-                            await add_timer_internal(guild, f"⚠️ Foundry Prep ({h}:00 match)", prep_ts, 12345, "📢 Message in Server (Ping Role)", "auto", 0, None, 900, [])
-                            
                             # Battle
-                            await add_timer_internal(guild, f"🔥 Foundry Battle ({h}:00 match)", ts, 12345, "📢 Message in Server (Ping Role)", "auto", 0, None, 3600, [])
-                            count += 2
+                            title = f"🔥 Foundry Battle - Legion 1" if h == l1_time else f"🔥 Foundry Battle - Legion 2"
+                            await add_timer_internal(guild, f"{title} ({h}:00)", ts, 12345, "📢 Message in Server (Ping Role)", "auto", 0, None, 3600, [600])
+                            count += 1
                         
                         await message.channel.send(f"✅ Awesome! I've scheduled **{count} alerts** for this Sunday in **{guild.name}**.")
                         del user_foundry_state[message.author.id]
@@ -1650,8 +1725,8 @@ async def on_message(message):
                         del user_foundry_state[message.author.id]
 
                 else:
-                    user_foundry_state[message.author.id]["step"] = "awaiting_time"
-                    await message.channel.send("Okay, let's try again. What time is the battle? (e.g. '14' or '19')")
+                    user_foundry_state[message.author.id]["step"] = "awaiting_l1_time"
+                    await message.channel.send("Okay, let's restart. What is the **Legion 1 time in UTC**? (Reply with the hour, e.g., '14' or '19')")
 
     if bot.user.mentioned_in(message) and not message.mention_everyone:
         embed = discord.Embed(title="☁️ Chrono Dashboard", color=discord.Color.blurple())
@@ -1723,10 +1798,10 @@ async def check_timers():
                      try:
                          u = await bot.fetch_user(lead_id)
                          if u:
-                             await u.send(f"👋 **Foundry Assistant here!**\nTime to schedule this Sunday's battle.\n\n**What time is the battle?** (Reply with the hour, e.g. `14` or `19`)")
-                             user_foundry_state[lead_id] = {"step": "awaiting_time", "guild_id": int(context_id_str)} # Store context
+                             await u.send(f"👋 **Foundry Assistant here!**\nTime to schedule this Sunday's battle.\n\n**What is the Legion 1 time in UTC?** (Reply with the hour, e.g., `14` or `19`)")
+                             user_foundry_state[lead_id] = {"step": "awaiting_l1_time", "guild_id": int(context_id_str)} # Store context
                      except: pass
-                     timer["end_epoch"] += 604800
+                     timer["end_epoch"] += 1209600
                      timer["start_epoch"] = current_time
                      active_timers.append(timer)
                      data_changed = True
@@ -1736,9 +1811,10 @@ async def check_timers():
             reminders = timer.get("reminders", [])
             sent = timer.get("sent_reminders", [])
             
+            remain = timer["end_epoch"] - current_time
+            
             for r_sec in reminders:
                 if r_sec in sent: continue
-                remain = timer["end_epoch"] - current_time
                 
                 # Check for "Due Now" OR "Missed but Event still Active"
                 # If remain <= r_sec, it means we passed the reminder point.
@@ -1747,7 +1823,10 @@ async def check_timers():
                      msg = ""
                      if remain > (r_sec - 30):
                          # Normal Timing (within 30s)
-                         msg = f"⚠️ **Reminder:** `{timer['label']}` in {get_interval_str(r_sec)}!"
+                         if r_sec == 600 and "Foundry Battle" in timer['label']:
+                             msg = f"⚠️ **Attention!** `{timer['label']}` in 10 minutes! **Call all troops back and free up the hospital NOW!**"
+                         else:
+                             msg = f"⚠️ **Reminder:** `{timer['label']}` in {get_interval_str(r_sec)}!"
                      else:
                          # Late Timing (Missed window)
                          msg = f"⚠️ **Late Reminder:** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
@@ -1766,6 +1845,34 @@ async def check_timers():
                      sent.append(r_sec)
                      timer["sent_reminders"] = sent
                      data_changed = True
+
+            # --- 5-Minute Early Tag ---
+            dur = timer["end_epoch"] - timer.get("start_epoch", timer["end_epoch"] - 301)
+            if dur >= 300:
+                if remain <= 300 and remain > -60 and "5min_ping" not in sent:
+                    msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
+                    notify = timer.get('notify_method', 'Silent')
+                    role_id = timer.get('role_id')
+                    
+                    content = msg
+                    if "Ping Role" in notify and role_id:
+                         content += f" <@&{role_id}>"
+                    elif "everyone" in notify:
+                         content += " @everyone"
+
+                    try:
+                        if guild:
+                            db_ch_id = context_data.get("dashboard_channel_id")
+                            if db_ch_id:
+                                ch = guild.get_channel(db_ch_id)
+                                if ch: await ch.send(content)
+                        elif user:
+                            await user.send(content)
+                    except: pass
+                    
+                    sent.append("5min_ping")
+                    timer["sent_reminders"] = sent
+                    data_changed = True
 
             # --- Expiry Check ---
             if current_time >= timer["end_epoch"]:
@@ -1790,10 +1897,13 @@ async def check_timers():
                     channel = guild.get_channel(db_ch_id) if db_ch_id else None
                     if channel:
                          content = msg
-                         if "Ping Role" in notify and role_id:
-                              content += f" <@&{role_id}>"
-                         elif "everyone" in notify:
-                              content += " @everyone"
+                         # Ping at expiry only if timer was too short for the 5-min warning
+                         dur = timer["end_epoch"] - timer.get("start_epoch", timer["end_epoch"] - 301)
+                         if dur < 300:
+                             if "Ping Role" in notify and role_id:
+                                  content += f" <@&{role_id}>"
+                             elif "everyone" in notify:
+                                  content += " @everyone"
                          
                          await channel.send(content)
                 elif user:
