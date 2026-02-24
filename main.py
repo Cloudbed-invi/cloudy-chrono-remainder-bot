@@ -1499,7 +1499,7 @@ async def check_missed_events():
 
 @bot.tree.command(name="dice", description="Roll a 6-sided dice")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.integration_types(guild=True, user=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def dice_slash(interaction: discord.Interaction):
     import random
     import os
