@@ -33,9 +33,9 @@ async def start_health_server():
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        print(f"🌐 Health server running on port {port}")
+        print(f"Health server running on port {port}")
     except Exception as e:
-        print(f"❌ Failed to start health server: {e}") 
+        print(f"Failed to start health server: {e}") 
 # ---------------------------
 
 import discord
@@ -71,6 +71,7 @@ class StratusBot(commands.Bot):
         
         # Register Persistent Views
         self.add_view(RPSView())
+        self.add_view(DiceView())
 
 bot = StratusBot()
 
@@ -1527,15 +1528,37 @@ async def check_missed_events():
             save_data(data)
             if guild: await update_dashboard(guild, context_data)
 
-@bot.tree.command(name="dice", description="Roll a 6-sided dice")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
-async def dice_slash(interaction: discord.Interaction):
+dice_pity_counters = {}
+
+class DiceView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="Roll Again", style=discord.ButtonStyle.primary, custom_id="dice_roll_again_btn", emoji="🎲")
+    async def roll_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await execute_dice(interaction)
+
+async def execute_dice(interaction: discord.Interaction):
     import random
     import os
     import asyncio
     
-    roll = random.randint(1, 6)
+    user_id = interaction.user.id
+    pity = dice_pity_counters.get(user_id, 0)
+    
+    # Dynamic weighting for Pity System (Target: Land a 6)
+    # Extremely subtle pity: adds a tiny fraction to the weight of rolling a 6.
+    # Base weight is 10.0 per face. A bonus of 0.0001 per miss is practically invisible.
+    pity_bonus = pity * 0.0001
+    weights = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0 + pity_bonus]
+    roll = random.choices([1, 2, 3, 4, 5, 6], weights=weights, k=1)[0]
+    
+    # Reset pity on a 6, otherwise increment
+    if roll == 6:
+        dice_pity_counters[user_id] = 0
+    else:
+        dice_pity_counters[user_id] = pity + 1
+    
     file_path = f"assets/dice_{roll}.png"
     rolling_path = "assets/rolling.gif"
     
@@ -1545,32 +1568,79 @@ async def dice_slash(interaction: discord.Interaction):
         file_roll = discord.File(rolling_path, filename="rolling.gif")
         embed_rolling.set_thumbnail(url="attachment://rolling.gif")
         
-        await interaction.response.send_message(embed=embed_rolling, file=file_roll)
+        # Determine if responding to a slash command or a button
+        if interaction.type == discord.InteractionType.application_command:
+            await interaction.response.defer(thinking=True)
+            msg_interaction = await interaction.followup.send(embed=embed_rolling, file=file_roll, wait=True)
+        else:
+            # We are responding to a button click
+            await interaction.response.edit_message(view=None)
+            content_str = f"{interaction.user.mention} rolled!"
+            try:
+                msg_interaction = await interaction.channel.send(
+                    content=content_str, 
+                    embed=embed_rolling, 
+                    file=file_roll
+                )
+            except discord.Forbidden:
+                file_roll = discord.File(rolling_path, filename="rolling.gif")
+                msg_interaction = await interaction.followup.send(
+                    content=content_str, 
+                    embed=embed_rolling, 
+                    file=file_roll,
+                    wait=True
+                )
         
         # 2. Wait for the roll animation
-        # Increased to 1.8s for better suspense + network buffer
         await asyncio.sleep(1.8)
         
         # 3. Edit the message: Swap the GIF out for a STATIC PNG result.
-        # This completely avoids the 'stuttering GIF' discord UI bug!
         embed_result = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
         file_result = discord.File(file_path, filename="dice.png")
         embed_result.set_thumbnail(url="attachment://dice.png")
         
-        await interaction.edit_original_response(embed=embed_result, attachments=[file_result])
+        view = DiceView()
         
+        try:
+            if interaction.type == discord.InteractionType.application_command:
+                await interaction.edit_original_response(
+                    embed=embed_result, 
+                    attachments=[file_result],
+                    view=view
+                )
+            else:
+                await msg_interaction.edit(
+                    embed=embed_result, 
+                    attachments=[file_result],
+                    view=view
+                )
+        except discord.NotFound:
+            pass
+            
     else:
         # Fallback if images missing
-        embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
-        await interaction.response.send_message(embed=embed)
+        if not interaction.response.is_done():
+            embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
+            await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="dice", description="Roll a 6-sided dice")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def dice_slash(interaction: discord.Interaction):
+    await execute_dice(interaction)
 
 class RPSView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         
-    @discord.ui.button(label="Play Again", style=discord.ButtonStyle.primary, custom_id="rps_play_again_btn", emoji="🔁")
-    async def play_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        play_btn = discord.ui.Button(label="Play Again", style=discord.ButtonStyle.primary, custom_id="rps_play_again_btn", emoji="🔁")
+        play_btn.callback = self.play_again
+        self.add_item(play_btn)
+        
+    async def play_again(self, interaction: discord.Interaction):
         await execute_rps(interaction)
+
+active_rps_matches = {}
 
 async def execute_rps(interaction: discord.Interaction):
     import random
@@ -1624,6 +1694,105 @@ async def execute_rps(interaction: discord.Interaction):
         result_text = f"Rolled **{bot_choice.title()}**!"
         color = discord.Color.blue()
         
+        # --- Automatic Matchmaking Logic (DMs only) ---
+        if interaction.guild is None: # Reliable check for DMs/Group DMs
+            import time
+            channel_id = str(interaction.channel_id)
+            user_id = str(interaction.user.id)
+            now = time.time()
+            
+            # Clean up old matches (older than 60s)
+            if channel_id in active_rps_matches:
+                match_data = active_rps_matches[channel_id]
+                if now - match_data['timestamp'] > 60:
+                    del active_rps_matches[channel_id]
+            
+            if channel_id in active_rps_matches and active_rps_matches[channel_id]['user_id'] != user_id:
+                # We have a match!
+                p1_id = active_rps_matches[channel_id]['user_id']
+                p1_name = active_rps_matches[channel_id].get('user_name', f"User {p1_id}")
+                p1_choice = active_rps_matches[channel_id]['choice']
+                
+                p2_id = user_id
+                p2_name = interaction.user.display_name
+                p2_choice = bot_choice
+                
+                # Determine winner
+                # rock beats scissors, scissors beats paper, paper beats rock
+                win_map = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+                
+                winner_id = None
+                if p1_choice == p2_choice:
+                    winner_id = "tie"
+                elif win_map[p1_choice] == p2_choice:
+                    winner_id = p1_id
+                else:
+                    winner_id = p2_id
+                    
+                del active_rps_matches[channel_id]
+                
+                if winner_id != "tie":
+                    from db import load_data, save_data
+                    all_data = load_data()
+                    dm_data = all_data.get("DM_Scores", {"channels": {}})
+                    channels = dm_data.get("channels", {})
+                    
+                    # 1. Passive Cleaner: Wipe inactive DM sessions (older than 3 hours)
+                    import time
+                    now = time.time()
+                    expired_keys = []
+                    for cid, cdata in channels.items():
+                        # If a session is old, or it doesn't have a timestamp yet (legacy), flag it
+                        if 'last_active' not in cdata or (now - cdata['last_active'] > 3600 * 3):
+                            expired_keys.append(cid)
+                    
+                    for cid in expired_keys:
+                        del channels[cid]
+                    
+                    # 2. Hard Cap Enforcer: 100 DMs limit just in case everyone is playing at once
+                    if channel_id not in channels and len(channels) >= 100:
+                        arbitrary_key = next(iter(channels))
+                        del channels[arbitrary_key]
+                        
+                    # 3. Initialize or retrieve the active channel session
+                    if channel_id not in channels:
+                        channels[channel_id] = {'scores': {}, 'last_active': now}
+                        
+                    session = channels[channel_id]
+                    scores = session.get('scores', {})
+                    scores[winner_id] = scores.get(winner_id, 0) + 1
+                    
+                    # Update activity timestamp
+                    session['scores'] = scores
+                    session['last_active'] = now
+                    channels[channel_id] = session
+                    
+                    # Save back to Supabase
+                    dm_data["channels"] = channels
+                    all_data["DM_Scores"] = dm_data
+                    save_data(all_data)
+                    
+                    p1_score = scores.get(p1_id, 0)
+                    p2_score = scores.get(p2_id, 0)
+                    
+                    winner_name = p1_name if winner_id == p1_id else p2_name
+                    winner_choice_str = p1_choice if winner_id == p1_id else p2_choice
+                    loser_choice_str = p2_choice if winner_id == p1_id else p1_choice
+                    
+                    result_text += f"\n\n🏆 **{winner_name}** wins! ({winner_choice_str.title()} beats {loser_choice_str.title()})\n\n**Scoreboard:**\n{p1_name}: {p1_score}\n{p2_name}: {p2_score}"
+                    color = discord.Color.green()
+                else:
+                    result_text += f"\n\n🤝 **It's a tie!** Both threw {p1_choice.title()}."
+                    color = discord.Color.gold()
+            else:
+                # Store this throw waiting for opponent
+                active_rps_matches[channel_id] = {
+                    'user_id': user_id,
+                    'user_name': interaction.user.display_name,
+                    'choice': bot_choice,
+                    'timestamp': now
+                }
+                
         embed_result = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description=result_text, color=color)
         file_result = discord.File(file_path, filename="rps.png")
         embed_result.set_thumbnail(url="attachment://rps.png")
@@ -1646,6 +1815,7 @@ async def execute_rps(interaction: discord.Interaction):
                 )
         except discord.NotFound:
             pass # Message might have been deleted by user during the wait
+                
     else:
         if not interaction.response.is_done():
             await interaction.response.send_message("Missing RPS image assets!", ephemeral=True)
