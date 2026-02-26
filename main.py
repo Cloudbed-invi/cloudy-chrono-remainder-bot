@@ -70,8 +70,12 @@ class StratusBot(commands.Bot):
         await start_health_server()
         
         # Register Persistent Views
-        self.add_view(RPSView())
         self.add_view(DiceView())
+        
+        # Force Sync Slash Commands
+        logger.info("Forcing Command Tree Sync...")
+        await self.tree.sync()
+        logger.info("Command Tree Synced!")
 
 bot = StratusBot()
 
@@ -1629,202 +1633,483 @@ async def execute_dice(interaction: discord.Interaction):
 async def dice_slash(interaction: discord.Interaction):
     await execute_dice(interaction)
 
-class RPSView(discord.ui.View):
-    def __init__(self):
+active_targeted_rps = {}
+
+class RPSChallengeView(discord.ui.View):
+    def __init__(self, match_id: str):
         super().__init__(timeout=None)
+        self.match_id = match_id
         
-        play_btn = discord.ui.Button(label="Play Again", style=discord.ButtonStyle.primary, custom_id="rps_play_again_btn", emoji="🔁")
-        play_btn.callback = self.play_again
-        self.add_item(play_btn)
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="rps_accept", emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = active_targeted_rps.get(self.match_id)
+        if not match:
+            await interaction.response.send_message("This challenge has expired!", ephemeral=True)
+            return
+        if interaction.user.id != match['target_id']:
+            await interaction.response.send_message("You are not the target of this challenge!", ephemeral=True)
+            return
+            
+        match['status'] = 'playing'
+        if match['mode'] == 'Random':
+            await interaction.response.defer()
+            await resolve_rps_match(interaction.message, self.match_id, None, None)
+        else:
+            view = RPSPlayView(self.match_id)
+            embed = discord.Embed(title="RPS Challenge Accepted!", description=f"<@{match['challenger_id']}> vs <@{match['target_id']}>\n\nBoth players, lock in your choices below!", color=discord.Color.green())
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+class RPSPlayView(discord.ui.View):
+    def __init__(self, match_id: str):
+        super().__init__(timeout=None)
+        self.match_id = match_id
         
-    async def play_again(self, interaction: discord.Interaction):
-        await execute_rps(interaction)
+    async def handle_lock(self, interaction: discord.Interaction, choice: str):
+        match = active_targeted_rps.get(self.match_id)
+        if not match:
+            await interaction.response.send_message("This match has expired!", ephemeral=True)
+            return
+            
+        uid = interaction.user.id
+        if uid not in (match['challenger_id'], match['target_id']):
+            await interaction.response.send_message("You are not in this match!", ephemeral=True)
+            return
+            
+        if uid in match['choices']:
+            await interaction.response.send_message("You already locked in!", ephemeral=True)
+            return
+            
+        match['choices'][uid] = choice
+        await interaction.response.send_message(f"You securely locked in **{choice.title()}**! 🤫", ephemeral=True)
+        
+        if len(match['choices']) == 2:
+            try: await interaction.message.edit(view=None)
+            except: pass
+            
+            # If playing Bot, auto-generate bot choice
+            p2_choice = match['choices'].get(match['target_id'])
+            if match['target_id'] == interaction.client.user.id:
+                import random
+                p2_choice = random.choice(["rock", "paper", "scissors"])
+                
+            await resolve_rps_match(interaction.message, self.match_id, match['choices'][match['challenger_id']], p2_choice)
 
-active_rps_matches = {}
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, custom_id="rps_btn_rock", emoji="🪨")
+    async def lock_rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "rock")
+        
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, custom_id="rps_btn_paper", emoji="📄")
+    async def lock_paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "paper")
+        
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, custom_id="rps_btn_scissors", emoji="✂️")
+    async def lock_scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "scissors")
 
-async def execute_rps(interaction: discord.Interaction):
+async def resolve_rps_match(msg: discord.Message, match_id: str, p1_choice: str = None, p2_choice: str = None):
     import random
     import os
     import asyncio
+    import time
     
-    # Determine bot choice
+    match = active_targeted_rps.get(match_id)
+    if not match: return
+    
+    del active_targeted_rps[match_id]
+    
     options = ["rock", "paper", "scissors"]
-    bot_choice = random.choice(options)
+    if not p1_choice: p1_choice = random.choice(options)
+    if not p2_choice: p2_choice = random.choice(options)
     
-    file_path = f"assets/rps_{bot_choice}.png"
     rolling_path = "assets/rps_roll.gif"
+    if not os.path.exists(rolling_path):
+        return
+        
+    embed_rolling = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description="Evaluating...", color=discord.Color.dark_gray())
+    embed_rolling.set_thumbnail(url="attachment://rps_roll.gif")
+    file_roll = discord.File(rolling_path, filename="rps_roll.gif")
     
-    if os.path.exists(file_path) and os.path.exists(rolling_path):
-        # 1. Send the looping "choosing..." GIF
-        embed_rolling = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description="Choosing...", color=discord.Color.dark_gray())
-        file_roll = discord.File(rolling_path, filename="rps_roll.gif")
-        embed_rolling.set_thumbnail(url="attachment://rps_roll.gif")
+    try:
+        await msg.edit(content=None, embed=embed_rolling, attachments=[file_roll], view=None)
+    except:
+        pass
         
-        # Determine if we are responding to a slash command or a button
-        if interaction.type == discord.InteractionType.application_command:
-            await interaction.response.defer(thinking=True)
-            msg_interaction = await interaction.followup.send(embed=embed_rolling, file=file_roll, wait=True)
-        else:
-            # We are responding to a button click
-            # Remove the button from the old message so only one "Play Again" button exists
-            await interaction.response.edit_message(view=None)
-            content_str = f"{interaction.user.mention} rolled!"
-            try:
-                # Send natively to channel to avoid Discord's visual "reply" tagging link
-                msg_interaction = await interaction.channel.send(
-                    content=content_str, 
-                    embed=embed_rolling, 
-                    file=file_roll
-                )
-            except discord.Forbidden:
-                # Fallback for user-apps without channel send permissions
-                # Re-instantiate file since it was closed by the failed request above
-                file_roll = discord.File(rolling_path, filename="rps_roll.gif")
-                msg_interaction = await interaction.followup.send(
-                    content=content_str, 
-                    embed=embed_rolling, 
-                    file=file_roll,
-                    wait=True
-                )
-            
-        # 2. Add suspense
-        await asyncio.sleep(1.8)
+    await asyncio.sleep(1.8)
+    
+    win_map = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+    
+    p1_id = str(match['challenger_id'])
+    p1_name = match['challenger_name']
+    p2_id = str(match['target_id'])
+    p2_name = match['target_name']
+    
+    if p1_choice == p2_choice:
+        winner_id = "tie"
+    elif win_map[p1_choice] == p2_choice:
+        winner_id = p1_id
+    else:
+        winner_id = p2_id
         
-        # 3. Swap to Static outcome
-        result_text = f"Rolled **{bot_choice.title()}**!"
-        color = discord.Color.blue()
+    result_text = f"<@{p1_id}> threw **{p1_choice.title()}**\n<@{p2_id}> threw **{p2_choice.title()}**\n"
+    color = discord.Color.gold()
+    
+    is_bot_match = (p2_id == str(msg.author.id))
+    
+    if winner_id != "tie":
+        winner_name = p1_name if winner_id == p1_id else p2_name
+        winner_choice_str = p1_choice if winner_id == p1_id else p2_choice
+        loser_choice_str = p2_choice if winner_id == p1_id else p1_choice
         
-        # --- Automatic Matchmaking Logic (DMs only) ---
-        if interaction.guild is None: # Reliable check for DMs/Group DMs
-            import time
-            channel_id = str(interaction.channel_id)
-            user_id = str(interaction.user.id)
+        color = discord.Color.green()
+        result_text += f"\n🏆 **{winner_name}** wins! ({winner_choice_str.title()} beats {loser_choice_str.title()})"
+        
+        if not is_bot_match:
+            from db import load_data, save_data
+            all_data = load_data()
+            is_dm = msg.guild is None
             now = time.time()
+            channel_id = str(msg.channel.id)
             
-            # Clean up old matches (older than 60s)
-            if channel_id in active_rps_matches:
-                match_data = active_rps_matches[channel_id]
-                if now - match_data['timestamp'] > 60:
-                    del active_rps_matches[channel_id]
-            
-            if channel_id in active_rps_matches and active_rps_matches[channel_id]['user_id'] != user_id:
-                # We have a match!
-                p1_id = active_rps_matches[channel_id]['user_id']
-                p1_name = active_rps_matches[channel_id].get('user_name', f"User {p1_id}")
-                p1_choice = active_rps_matches[channel_id]['choice']
-                
-                p2_id = user_id
-                p2_name = interaction.user.display_name
-                p2_choice = bot_choice
-                
-                # Determine winner
-                # rock beats scissors, scissors beats paper, paper beats rock
-                win_map = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
-                
-                winner_id = None
-                if p1_choice == p2_choice:
-                    winner_id = "tie"
-                elif win_map[p1_choice] == p2_choice:
-                    winner_id = p1_id
-                else:
-                    winner_id = p2_id
-                    
-                del active_rps_matches[channel_id]
-                
-                if winner_id != "tie":
-                    from db import load_data, save_data
-                    all_data = load_data()
-                    dm_data = all_data.get("DM_Scores", {"channels": {}})
-                    channels = dm_data.get("channels", {})
-                    
-                    # 1. Passive Cleaner: Wipe inactive DM sessions (older than 3 hours)
-                    import time
-                    now = time.time()
-                    expired_keys = []
-                    for cid, cdata in channels.items():
-                        # If a session is old, or it doesn't have a timestamp yet (legacy), flag it
-                        if 'last_active' not in cdata or (now - cdata['last_active'] > 3600 * 3):
-                            expired_keys.append(cid)
-                    
-                    for cid in expired_keys:
-                        del channels[cid]
-                    
-                    # 2. Hard Cap Enforcer: 100 DMs limit just in case everyone is playing at once
-                    if channel_id not in channels and len(channels) >= 100:
-                        arbitrary_key = next(iter(channels))
-                        del channels[arbitrary_key]
-                        
-                    # 3. Initialize or retrieve the active channel session
-                    if channel_id not in channels:
-                        channels[channel_id] = {'scores': {}, 'last_active': now}
-                        
-                    session = channels[channel_id]
-                    scores = session.get('scores', {})
-                    scores[winner_id] = scores.get(winner_id, 0) + 1
-                    
-                    # Update activity timestamp
-                    session['scores'] = scores
-                    session['last_active'] = now
-                    channels[channel_id] = session
-                    
-                    # Save back to Supabase
-                    dm_data["channels"] = channels
-                    all_data["DM_Scores"] = dm_data
-                    save_data(all_data)
-                    
-                    p1_score = scores.get(p1_id, 0)
-                    p2_score = scores.get(p2_id, 0)
-                    
-                    winner_name = p1_name if winner_id == p1_id else p2_name
-                    winner_choice_str = p1_choice if winner_id == p1_id else p2_choice
-                    loser_choice_str = p2_choice if winner_id == p1_id else p1_choice
-                    
-                    result_text += f"\n\n🏆 **{winner_name}** wins! ({winner_choice_str.title()} beats {loser_choice_str.title()})\n\n**Scoreboard:**\n{p1_name}: {p1_score}\n{p2_name}: {p2_score}"
-                    color = discord.Color.green()
-                else:
-                    result_text += f"\n\n🤝 **It's a tie!** Both threw {p1_choice.title()}."
-                    color = discord.Color.gold()
+            if is_dm:
+                target_row_id = "DM_Scores"
+                target_data = all_data.get(target_row_id, {"channels": {}})
+                channels = target_data.get("channels", {})
             else:
-                # Store this throw waiting for opponent
-                active_rps_matches[channel_id] = {
-                    'user_id': user_id,
-                    'user_name': interaction.user.display_name,
-                    'choice': bot_choice,
-                    'timestamp': now
-                }
+                target_row_id = str(msg.guild.id)
+                target_data = all_data.get(target_row_id, {})
+                channels = target_data.get("rps_sessions", {})
                 
-        embed_result = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description=result_text, color=color)
+            expired_keys = [cid for cid, cdata in channels.items() if ('last_active' not in cdata or (now - cdata['last_active'] > 3600 * 3))]
+            for cid in expired_keys: del channels[cid]
+            if channel_id not in channels and len(channels) >= 100:
+                del channels[next(iter(channels))]
+                
+            if channel_id not in channels:
+                channels[channel_id] = {'scores': {}, 'last_active': now}
+                
+            session = channels[channel_id]
+            scores = session.get('scores', {})
+            scores[winner_id] = scores.get(winner_id, 0) + 1
+            session['scores'] = scores
+            session['last_active'] = now
+            channels[channel_id] = session
+            
+            if is_dm: target_data["channels"] = channels
+            else: target_data["rps_sessions"] = channels
+            all_data[target_row_id] = target_data
+            save_data(all_data)
+            
+            result_text += f"\n\n**Scoreboard:**\n{p1_name}: {scores.get(p1_id, 0)}\n{p2_name}: {scores.get(p2_id, 0)}"
+            
+    else:
+        result_text += f"\n🤝 **It's a tie!** Both threw {p1_choice.title()}."
+        
+    img_choice = p1_choice if winner_id == p1_id else p2_choice
+    if winner_id == "tie": img_choice = p1_choice
+    file_path = f"assets/rps_{img_choice}.png"
+    
+    embed_result = discord.Embed(title="✊ ✋ ✌️ Rock Paper Scissors", description=result_text, color=color)
+    if os.path.exists(file_path):
         file_result = discord.File(file_path, filename="rps.png")
         embed_result.set_thumbnail(url="attachment://rps.png")
-        
-        view = RPSView()
-        
         try:
-            if interaction.type == discord.InteractionType.application_command:
-                await interaction.edit_original_response(
-                    embed=embed_result, 
-                    attachments=[file_result],
-                    view=view
-                )
-            else:
-                # If it was a followup from a button click, we edit the message itself
-                await msg_interaction.edit(
-                    embed=embed_result, 
-                    attachments=[file_result],
-                    view=view
-                )
-        except discord.NotFound:
-            pass # Message might have been deleted by user during the wait
-                
+            await msg.edit(content=None, embed=embed_result, attachments=[file_result], view=None)
+        except:
+            pass
     else:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("Missing RPS image assets!", ephemeral=True)
+        try:
+            await msg.edit(content=None, embed=embed_result, view=None)
+        except:
+            pass
 
-@bot.tree.command(name="rps", description="Roll a random Rock, Paper, Scissors hand!")
+@bot.tree.command(name="rps", description="Challenge a user or the bot to Rock, Paper, Scissors!")
+@app_commands.describe(target="The user to challenge (leave empty for Bot)", mode="How to play (Selection or Random)")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Selection (Pick moves)", value="Selection"),
+    app_commands.Choice(name="Random (Auto RNG)", value="Random")
+])
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
-async def rps_slash(interaction: discord.Interaction):
-    await execute_rps(interaction)
+async def rps_slash(interaction: discord.Interaction, target: discord.Member = None, mode: app_commands.Choice[str] = None):
+    match_id = f"{interaction.id}"
+    chosen_mode = mode.value if mode else "Selection"
+    
+    if target is None or target.id == interaction.user.id:
+        active_targeted_rps[match_id] = {
+            'challenger_id': interaction.user.id,
+            'challenger_name': interaction.user.display_name,
+            'target_id': interaction.client.user.id,
+            'target_name': interaction.client.user.display_name,
+            'mode': chosen_mode,
+            'status': 'playing',
+            'choices': {}
+        }
+        
+        if chosen_mode == "Random":
+            await interaction.response.defer()
+            msg = await interaction.followup.send("Rolling...", wait=True)
+            await resolve_rps_match(msg, match_id, None, None)
+        else:
+            view = RPSPlayView(match_id)
+            embed = discord.Embed(title="RPS vs Bot!", description="Lock in your choice below!", color=discord.Color.blue())
+            await interaction.response.send_message(embed=embed, view=view)
+            
+    else:
+        active_targeted_rps[match_id] = {
+            'challenger_id': interaction.user.id,
+            'challenger_name': interaction.user.display_name,
+            'target_id': target.id,
+            'target_name': target.display_name,
+            'mode': chosen_mode,
+            'status': 'waiting',
+            'choices': {}
+        }
+        
+        view = RPSChallengeView(match_id)
+        embed = discord.Embed(title="⚔️ RPS Challenge!", description=f"<@{target.id}>, you have been challenged to RPS by <@{interaction.user.id}>!\n\nMode: **{chosen_mode}**", color=discord.Color.gold())
+        await interaction.response.send_message(content=f"<@{target.id}>", embed=embed, view=view)
+
+
+
+
+active_brawls = {}
+
+class BrawlJoinView(discord.ui.View):
+    def __init__(self, message_id: str):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+        
+    @discord.ui.button(label="Join Brawl!", style=discord.ButtonStyle.success, custom_id="brawl_btn_join", emoji="⚔️")
+    async def join_brawl(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = active_brawls.get(self.message_id)
+        if not match or match['status'] != 'joining':
+            await interaction.response.send_message("This Brawl is no longer accepting players!", ephemeral=True)
+            return
+            
+        uid = str(interaction.user.id)
+        if uid in match['players']:
+            await interaction.response.send_message("You are already in the lobby!", ephemeral=True)
+            return
+            
+        match['players'][uid] = {
+            'name': interaction.user.display_name,
+            'choice': None
+        }
+        await interaction.response.send_message("You joined the Brawl!", ephemeral=True)
+        
+        player_names = [data['name'] for data in match['players'].values()]
+        embed = interaction.message.embeds[0]
+        desc = embed.description.split("**Joined Players:**")[0]
+        embed.description = desc + f"**Joined Players:** {', '.join(player_names)}"
+        try: await interaction.message.edit(embed=embed)
+        except: pass
+
+    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, custom_id="brawl_btn_start")
+    async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = active_brawls.get(self.message_id)
+        if not match: return
+        if str(interaction.user.id) != match['host_id']:
+            await interaction.response.send_message("Only the Host can start the game!", ephemeral=True)
+            return
+            
+        if len(match['players']) < 2:
+            await interaction.response.send_message("At least 2 players must join to start!", ephemeral=True)
+            return
+            
+        match['status'] = 'playing'
+        await interaction.response.defer()
+        await spawn_brawl_round(interaction.message, self.message_id, 1)
+
+    @discord.ui.button(label="Cancel Game", style=discord.ButtonStyle.danger, custom_id="brawl_btn_cancel")
+    async def cancel_game(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = active_brawls.get(self.message_id)
+        if not match: return
+        if str(interaction.user.id) != match['host_id']:
+            await interaction.response.send_message("Only the Host can cancel the game!", ephemeral=True)
+            return
+            
+        del active_brawls[self.message_id]
+        await interaction.response.edit_message(content="**Brawl Canceled by Host.**", embed=None, view=None)
+
+class BrawlPlayView(discord.ui.View):
+    def __init__(self, message_id: str):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+        
+    async def handle_lock(self, interaction: discord.Interaction, choice: str):
+        match = active_brawls.get(self.message_id)
+        if not match or match['status'] != 'playing':
+            await interaction.response.send_message("This matches choices are closed!", ephemeral=True)
+            return
+            
+        uid = str(interaction.user.id)
+        if uid not in match['players']:
+            await interaction.response.send_message("You are not part of this Brawl!", ephemeral=True)
+            return
+            
+        if match['players'][uid]['choice'] is not None:
+            await interaction.response.send_message("You already locked in!", ephemeral=True)
+            return
+            
+        match['players'][uid]['choice'] = choice
+        await interaction.response.send_message(f"You securely locked in **{choice.title()}**! 🤫", ephemeral=True)
+        
+        all_locked = all(p['choice'] is not None for p in match['players'].values())
+        if all_locked:
+            match['status'] = 'resolving'
+            try: await interaction.message.edit(view=None)
+            except: pass
+            await resolve_brawl_round(interaction.message, self.message_id, match['round_num'])
+            
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_rock", emoji="🪨")
+    async def lock_rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "rock")
+        
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_paper", emoji="📄")
+    async def lock_paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "paper")
+        
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_scissors", emoji="✂️")
+    async def lock_scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_lock(interaction, "scissors")
+        
+    @discord.ui.button(label="Host: Force Skip AFK", style=discord.ButtonStyle.danger, custom_id="brawl_btn_skip", row=1)
+    async def force_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        match = active_brawls.get(self.message_id)
+        if not match or match['status'] != 'playing': return
+        if str(interaction.user.id) != match['host_id']:
+            await interaction.response.send_message("Only the Host can Force Skip!", ephemeral=True)
+            return
+            
+        afk_uids = [uid for uid, p in match['players'].items() if p['choice'] is None]
+        for uid in afk_uids:
+            del match['players'][uid]
+            
+        if len(match['players']) < 2:
+            del active_brawls[self.message_id]
+            await interaction.response.edit_message(content="Not enough players left. Game ended.", embed=None, view=None)
+            return
+            
+        match['status'] = 'resolving'
+        await interaction.response.defer()
+        try: await interaction.message.edit(view=None)
+        except: pass
+        await resolve_brawl_round(interaction.message, self.message_id, match['round_num'])
+
+async def spawn_brawl_round(msg: discord.Message, message_id: str, round_num: int):
+    match = active_brawls.get(message_id)
+    if not match: return
+    
+    match['round_num'] = round_num
+    for uid in match['players']:
+        match['players'][uid]['choice'] = None
+        
+    match['status'] = 'playing'
+    
+    mentions = " ".join([f"<@{uid}>" for uid in match['players']])
+    embed = discord.Embed(title=f"⚔️ Brawl! Round {round_num} of {match['max_rounds']}", description=f"The match has started! All players, click your throw below securely!\n\n**Players:** {mentions}", color=discord.Color.red())
+    view = BrawlPlayView(message_id)
+    
+    try:
+        await msg.edit(content=mentions, embed=embed, view=view)
+    except Exception as e:
+        print(e)
+        
+async def resolve_brawl_round(msg: discord.Message, message_id: str, round_num: int):
+    match = active_brawls.get(message_id)
+    if not match: return
+    
+    players = match['players']
+    scores_this_round = {uid: 0 for uid in players.keys()}
+    win_map = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+    
+    for uid1, data1 in players.items():
+        for uid2, data2 in players.items():
+            if uid1 == uid2: continue
+            
+            p1_choice = data1['choice']
+            p2_choice = data2['choice']
+            
+            if win_map[p1_choice] == p2_choice:
+                scores_this_round[uid1] += 1
+                
+    for uid, pts in scores_this_round.items():
+        match['db_scores'][uid] = match['db_scores'].get(uid, 0) + pts
+        
+    embed = discord.Embed(title=f"⚔️ Brawl Results (Round {round_num} of {match['max_rounds']})", color=discord.Color.purple())
+    
+    choice_groups = {"rock": [], "paper": [], "scissors": []}
+    for uid, data in players.items():
+        choice_groups[data['choice']].append(data['name'])
+        
+    desc = ""
+    if choice_groups["rock"]: desc += f"🪨 **Rock:** {', '.join(choice_groups['rock'])}\n"
+    if choice_groups["paper"]: desc += f"📄 **Paper:** {', '.join(choice_groups['paper'])}\n"
+    if choice_groups["scissors"]: desc += f"✂️ **Scissors:** {', '.join(choice_groups['scissors'])}\n"
+        
+    desc += "\n**Match Leaderboard:**\n"
+    sorted_scores = sorted(match['db_scores'].items(), key=lambda x: x[1], reverse=True)
+    for uid, total_pts in sorted_scores:
+        round_pts = scores_this_round.get(uid, 0)
+        if round_pts > 0: desc += f"<@{uid}>: **{total_pts}** pts (+{round_pts})\n"
+        else: desc += f"<@{uid}>: **{total_pts}** pts\n"
+        
+    embed.description = desc
+    
+    view = discord.ui.View(timeout=None)
+    if round_num < match['max_rounds']:
+        next_btn = discord.ui.Button(label=f"Host: Start Round {round_num + 1}", style=discord.ButtonStyle.primary, emoji="🔥")
+        async def next_round_cb(btn_int: discord.Interaction):
+            if str(btn_int.user.id) != match['host_id']:
+                await btn_int.response.send_message("Only the Host can start the next round!", ephemeral=True)
+                return
+            await btn_int.response.defer()
+            await spawn_brawl_round(msg, message_id, round_num + 1)
+        next_btn.callback = next_round_cb
+        view.add_item(next_btn)
+        
+    end_btn = discord.ui.Button(label="Host: End Game", style=discord.ButtonStyle.danger)
+    async def end_cb(btn_int: discord.Interaction):
+        if str(btn_int.user.id) != match['host_id']:
+            await btn_int.response.send_message("Only the Host can end the game!", ephemeral=True)
+            return
+            
+        del active_brawls[message_id]
+        embed.title = "🏆 Final Brawl Results"
+        await btn_int.response.edit_message(embed=embed, view=None)
+        
+        # Save points to DB here if we wanted persistent points! 
+        # (For now the user requested a unified session wipe, so we skip standard DB saving, 
+        #  but we COULD integrate it into the general rps_scores).
+        
+    end_btn.callback = end_cb
+    view.add_item(end_btn)
+    
+    try: await msg.edit(content=None, embed=embed, view=view)
+    except: pass
+
+@bot.tree.command(name="brawl", description="Start a multiplayer RPS Brawl!")
+@app_commands.describe(max_rounds="Number of rounds (Default 3, Max 10)")
+@app_commands.allowed_contexts(guilds=True)
+async def brawl_slash(interaction: discord.Interaction, max_rounds: app_commands.Range[int, 1, 10] = 3):
+    message_id = f"{interaction.id}"
+    
+    active_brawls[message_id] = {
+        'host_id': str(interaction.user.id),
+        'max_rounds': max_rounds,
+        'status': 'joining',
+        'round_num': 1,
+        'db_scores': {str(interaction.user.id): 0},
+        'players': {
+            str(interaction.user.id): {'name': interaction.user.display_name, 'choice': None}
+        }
+    }
+    
+    embed = discord.Embed(title="⚔️ RPS Brawl Lobby!", description=f"<@{interaction.user.id}> started a Brawl! Click **Join Brawl!** if you want to play.\n\n**Joined Players:** {interaction.user.display_name}", color=discord.Color.purple())
+    view = BrawlJoinView(message_id)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 
 @bot.event
 async def on_message(message):
