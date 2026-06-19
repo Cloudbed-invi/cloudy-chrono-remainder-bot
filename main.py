@@ -46,7 +46,10 @@ import time
 import asyncio
 import re
 import logging
+from typing import Any
 from datetime import datetime, timedelta, timezone
+import zoneinfo
+import groq
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s', datefmt='%H:%M:%S')
@@ -56,14 +59,119 @@ logger = logging.getLogger("Chrono")
 from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+groq_client = None
+if GROQ_API_KEY:
+    groq_client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+
+from db_turso import init_db
+init_db()
+
 DUMMY_SPACER = "https://dummyimage.com/600x1/2f3136/2f3136.png"
 
+DM_TEMPLATES = {
+    "Custom": {"emoji": "✏️", "desc": "Enter manually", "label": None, "time": None, "recur": None, "adv": None},
+    "Test Template": {"emoji": "🧪", "desc": "Auto-fills 'Test Event'", "label": "Test Event", "time": "1m", "recur": None, "adv": None},
+    "Internal": {"emoji": "🏰", "desc": "Internal Castle (28d cycle)", "label": "Internal Castle [Battle]", "time": None, "recur": "28d", "adv": "5h | 30m, 5m"},
+    "SvS": {"emoji": "⚔️", "desc": "SvS Battle (28d cycle)", "label": "SvS Castle Battle", "time": None, "recur": "28d", "adv": "5h | 2h, 1h"},
+    "Arena": {"emoji": "🛡️", "desc": "Daily Arena Reset", "label": "Arena Reset", "time": None, "recur": "24h", "adv": "5m"},
+    "Bear": {"emoji": "🐻", "desc": "Bear Trap (47h 30m)", "label": "🐻 Bear Trap", "time": None, "recur": "47h 30m", "adv": "30m | 5m"},
+    "Joe": {"emoji": "🤡", "desc": "Crazy Joe (40m)", "label": "🤡 Crazy Joe", "time": None, "recur": "0", "adv": "40m | 5m"},
+}
+
 # --- Bot Setup ---
+import sqlite3
+
+if not os.path.exists('db'):
+    os.makedirs('db')
+    print("db folder created")
+
+databases = {
+    "conn_alliance": "db/alliance.sqlite",
+    "conn_giftcode": "db/giftcode.sqlite",
+    "conn_changes": "db/changes.sqlite",
+    "conn_users": "db/users.sqlite",
+    "conn_settings": "db/settings.sqlite",
+}
+
+connections = {name: sqlite3.connect(path) for name, path in databases.items()}
+
+def create_tables():
+    with connections["conn_changes"] as conn_changes:
+        conn_changes.execute('''CREATE TABLE IF NOT EXISTS nickname_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            fid INTEGER, 
+            old_nickname TEXT, 
+            new_nickname TEXT, 
+            change_date TEXT
+        )''')
+        conn_changes.execute('''CREATE TABLE IF NOT EXISTS furnace_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            fid INTEGER, 
+            old_furnace_lv INTEGER, 
+            new_furnace_lv INTEGER, 
+            change_date TEXT
+        )''')
+
+    with connections["conn_settings"] as conn_settings:
+        conn_settings.execute('''CREATE TABLE IF NOT EXISTS botsettings (
+            id INTEGER PRIMARY KEY, 
+            channelid INTEGER, 
+            giftcodestatus TEXT 
+        )''')
+        conn_settings.execute('''CREATE TABLE IF NOT EXISTS admin (
+            id INTEGER PRIMARY KEY, 
+            is_initial INTEGER
+        )''')
+
+    with connections["conn_users"] as conn_users:
+        conn_users.execute('''CREATE TABLE IF NOT EXISTS users (
+            fid INTEGER PRIMARY KEY, 
+            nickname TEXT, 
+            furnace_lv INTEGER DEFAULT 0, 
+            kid INTEGER, 
+            stove_lv_content TEXT, 
+            alliance TEXT
+        )''')
+
+    with connections["conn_giftcode"] as conn_giftcode:
+        conn_giftcode.execute('''CREATE TABLE IF NOT EXISTS gift_codes (
+            giftcode TEXT PRIMARY KEY, 
+            date TEXT
+        )''')
+        conn_giftcode.execute('''CREATE TABLE IF NOT EXISTS user_giftcodes (
+            fid INTEGER, 
+            giftcode TEXT, 
+            status TEXT, 
+            PRIMARY KEY (fid, giftcode),
+            FOREIGN KEY (giftcode) REFERENCES gift_codes (giftcode)
+        )''')
+
+    with connections["conn_alliance"] as conn_alliance:
+        conn_alliance.execute('''CREATE TABLE IF NOT EXISTS alliancesettings (
+            alliance_id INTEGER PRIMARY KEY, 
+            channel_id INTEGER, 
+            interval INTEGER
+        )''')
+        conn_alliance.execute('''CREATE TABLE IF NOT EXISTS alliance_list (
+            alliance_id INTEGER PRIMARY KEY, 
+            name TEXT
+        )''')
+
+create_tables()
+
 class StratusBot(commands.Bot):
     def __init__(self):
-        # Deployment: All Intents needed for member/role fetch & events
-        intents = discord.Intents.all()
-        super().__init__(command_prefix="!", intents=intents)
+        # Optimization for 512MB RAM: Only enable strictly needed intents
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True   # Needed for role fetching
+        # Presences consume massive amounts of RAM: KEEP DISABLED
+        intents.presences = False 
+        
+        # Max_messages limits the internal memory cache to 10 (default 1000)
+        super().__init__(command_prefix="!", intents=intents, max_messages=10)
 
     async def setup_hook(self):
         # Start health check immediately, don't wait for Discord connection
@@ -72,6 +180,8 @@ class StratusBot(commands.Bot):
         # Register Persistent Views
         self.add_view(DiceView())
         
+        # Legacy cogs removed.
+        
         # Force Sync Slash Commands
         logger.info("Forcing Command Tree Sync...")
         await self.tree.sync()
@@ -79,8 +189,8 @@ class StratusBot(commands.Bot):
 
 bot = StratusBot()
 
-# --- Data Management (Supabase) ---
-from db import load_data, save_data
+# --- Data Management (Turso Legacy Storage) ---
+from db_turso import load_legacy_data as load_data, save_legacy_data as save_data
 
 # --- Autocomplete Helper ---
 async def timer_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -115,6 +225,28 @@ def generate_gcal_link(label: str, start_epoch: int, duration_seconds: int = 360
     }
     query = urllib.parse.urlencode(params)
     return f"https://www.google.com/calendar/render?{query}"
+
+# --- User Timezone Helpers ---
+def get_user_tz_str(user_id: int) -> str:
+    data = load_data()
+    prefs = data.get("USER_PREFS", {})
+    return prefs.get(str(user_id), "UTC")
+
+def set_user_tz_str(user_id: int, tz_str: str) -> bool:
+    data = load_data()
+    if "USER_PREFS" not in data:
+        data["USER_PREFS"] = {}
+    
+    try:
+        if tz_str.upper() == "UTC":
+            data["USER_PREFS"][str(user_id)] = "UTC"
+        else:
+            zoneinfo.ZoneInfo(tz_str)
+            data["USER_PREFS"][str(user_id)] = tz_str
+        save_data(data)
+        return True
+    except:
+        return False
 
 # --- Helpers ---
 def parse_duration_string(input_str: str) -> int:
@@ -154,19 +286,28 @@ def parse_reminders_string(input_str: str) -> list:
         return [parse_duration_string(p) for p in parts if p]
     except: return []
 
-def parse_time_input(user_input: str, mode: str = "smart") -> int:
+def parse_time_input(user_input: str, mode: str = "smart", user_tz_str: str = "UTC") -> int | tuple[str, str]:
     user_input = user_input.strip().lower()
+    
+    try:
+        user_tz = zoneinfo.ZoneInfo(user_tz_str) if user_tz_str.upper() != "UTC" else timezone.utc
+    except:
+        user_tz = timezone.utc
+        
+    current_local = datetime.now(user_tz)
     current_utc = datetime.now(timezone.utc)
     
     if mode == "smart":
-        try: return parse_time_input(user_input, "utc_custom")
+        try: return parse_time_input(user_input, "utc_custom", user_tz_str)
+        except: pass
+        try: return parse_time_input(user_input, "utc_date_only", user_tz_str)
         except: pass
         if re.match(r"^\d{1,2}:\d{2}$", user_input):
-             try: return parse_time_input(user_input, "utc_today")
+             try: return parse_time_input(user_input, "utc_today", user_tz_str)
              except: pass
-        try: return parse_time_input(user_input, "duration")
+        try: return parse_time_input(user_input, "duration", user_tz_str)
         except: pass
-        raise ValueError("Invalid Time. Use '10m', '14:00', or 'YYYY-MM-DD HH:MM'.")
+        raise ValueError(f"Invalid Time. Use '10m', '14:00' ({user_tz_str}), or 'YYYY-MM-DD'.")
 
     if mode == "duration":
         # Don't catch/mask here, let parse_duration_string error bubble up
@@ -179,7 +320,7 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
             hour = int(match.group(1))
             minute = int(match.group(2))
             if not (0 <= hour <= 23 and 0 <= minute <= 59): raise ValueError("Time out of range.")
-            target = current_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            target = current_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return int(target.timestamp())
         raise ValueError("Invalid Format.")
 
@@ -188,7 +329,7 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
         if match:
             hour = int(match.group(1))
             minute = int(match.group(2))
-            target = current_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            target = current_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
             target += timedelta(days=1)
             return int(target.timestamp())
         raise ValueError("Invalid Format.")
@@ -204,9 +345,34 @@ def parse_time_input(user_input: str, mode: str = "smart") -> int:
         ]
         for fmt in formats:
             try:
+                user_tz = zoneinfo.ZoneInfo(user_tz_str) if user_tz_str.upper() != "UTC" else timezone.utc
+            except:
+                user_tz = timezone.utc
+            
+            try:
                 dt = datetime.strptime(user_input, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=user_tz)
                 return int(dt.timestamp())
+            except ValueError: continue
+        raise ValueError("Invalid Format.")
+
+    elif mode == "utc_date_only":
+        formats = [
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%d-%m-%Y",
+            "%d/%m/%Y"
+        ]
+        for fmt in formats:
+            try:
+                user_tz = zoneinfo.ZoneInfo(user_tz_str) if user_tz_str.upper() != "UTC" else timezone.utc
+            except:
+                user_tz = timezone.utc
+
+            try:
+                dt = datetime.strptime(user_input, fmt)
+                dt = dt.replace(tzinfo=user_tz)
+                return ("DATE_ONLY", dt.strftime("%Y-%m-%d"))
             except ValueError: continue
         raise ValueError("Invalid Format.")
     
@@ -346,13 +512,26 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
 
 def check_permissions(interaction: discord.Interaction, owner_id: int) -> bool:
-    """True if user is Owner OR Admin."""
+    """True if user is Owner OR has management perms OR outranks the owner."""
     if interaction.user.id == owner_id: return True
-    if is_admin(interaction): return True
+    if not interaction.guild: return False # In DMs, only owner can edit (checked above)
+    if interaction.user.guild_permissions.administrator: return True
+    if interaction.user.guild_permissions.manage_roles: return True
+    if interaction.user.guild_permissions.manage_messages: return True
+    
+    # Hierarchy check
+    owner_member = interaction.guild.get_member(owner_id)
+    if owner_member and interaction.user.top_role.position > owner_member.top_role.position:
+        return True
     return False
 
 # --- Foundry State ---
-user_foundry_state = {} # {user_id: {"step": "awaiting_time", "guild_id": 123, "channel_id": 456}}
+user_foundry_state: dict[int, dict[str, Any]] = {} # {user_id: {"step": "awaiting_time", "guild_id": 123, "channel_id": 456}}
+user_cycle_states: dict[int, dict[str, Any]] = {}
+
+# --- DM Setup Wizard State ---
+user_setup_state: dict[int, dict[str, Any]] = {}
+# Format: {user_id: {"step": str, "guild_id": int, "data": {"label": ..., "end_epoch": ..., etc}}}
 
 # --- UI Components ---
 class EditTimerModal(discord.ui.Modal, title="Edit Timer"):
@@ -592,11 +771,12 @@ class ManageTimersView(discord.ui.View):
                     except: pass
 
 class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
-    def __init__(self, mode: str, notify_method: str, role_id: int, default_label: str = None, default_time: str = None, template_type: str = None):
+    def __init__(self, mode: str, notify_method: str, role_id: int, user_tz: str, default_label: str | None = None, default_time: str | None = None, template_type: str | None = None):
         super().__init__()
         self.mode = mode
         self.notify_method = notify_method
         self.role_id = role_id
+        self.user_tz = user_tz
         
         self.label_input = discord.ui.TextInput(
             label="Event Label", placeholder="e.g. Server Restart", default=default_label, max_length=50
@@ -604,7 +784,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         self.add_item(self.label_input)
         
         self.time_input = discord.ui.TextInput(
-            label="Time Until Alert", placeholder="e.g. 10m, 14:00, or 2026-02-19 12:30", default=default_time, min_length=2, max_length=20
+            label=f"Time Until Alert ({self.user_tz})", placeholder=f"e.g. 10m, 14:00, or YYYY-MM-DD", default=default_time, min_length=2, max_length=20
         )
         self.add_item(self.time_input)
 
@@ -612,21 +792,10 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         def_recur = None
         def_adv = None
         
-        if template_type == "Internal":
-            def_recur = "28d"
-            def_adv = "5h | 30m, 5m"
-        elif template_type == "SvS":
-            def_recur = "28d"
-            def_adv = "5h | 2h, 1h"
-        elif template_type == "Arena":
-            def_recur = "24h"
-            def_adv = "5m"
-        elif template_type == "Bear":
-            def_recur = "47h 30m" # Approx 2 days
-            def_adv = "30m | 5m"
-        elif template_type == "Joe":
-             def_recur = "0"
-             def_adv = "40m | 5m"
+        if template_type and template_type in DM_TEMPLATES:
+            tpl = DM_TEMPLATES[template_type]
+            def_recur = tpl.get("recur")
+            def_adv = tpl.get("adv")
 
         self.recur_input = discord.ui.TextInput(
             label="Repeat Interval (Optional)", placeholder="e.g. 5m, 24h", default=def_recur, required=False, max_length=10
@@ -634,7 +803,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         self.add_item(self.recur_input)
         
         self.adv_input = discord.ui.TextInput(
-             label="Duration | Reminder (Optional)", placeholder="1h | 10m, 5m", default=def_adv, required=False, max_length=50
+             label="Duration | Reminders (Optional)", placeholder="e.g. 1h | 10m, 5m", default=def_adv, required=False, max_length=50
         )
         self.add_item(self.adv_input)
 
@@ -655,7 +824,10 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
             # "smart" is not a dropdown option, but passed for "Custom" maybe? 
             # Check TimerWizardView.select_mode: options are duration, utc_today, utc_tomorrow, utc_custom
             parse_mode = self.mode if self.mode in ["utc_today", "utc_tomorrow", "duration", "utc_custom"] else "smart"
-            end_epoch = parse_time_input(self.time_input.value, parse_mode)
+            end_epoch = parse_time_input(self.time_input.value, parse_mode, self.user_tz)
+            
+            if isinstance(end_epoch, tuple) and end_epoch[0] == "DATE_ONLY":
+                raise ValueError(f"Please provide a specific time along with the date (e.g., '{end_epoch[1]} 14:30 {self.user_tz}').")
             
             recurrence_val = self.recur_input.value.strip()
             recurrence_seconds = 0
@@ -675,7 +847,7 @@ class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
         await add_timer(
             interaction, 
             self.label_input.value, 
-            end_epoch, 
+            int(end_epoch), # Type hint cast
             self.role_id, 
             self.notify_method, 
             self.mode, # Store original mode
@@ -864,17 +1036,16 @@ class TimerWizardView(discord.ui.View):
         def_label = None
         def_time = None
         
-        # Template Logic
-        # Template Logic
-        if self.template == "Test Template":
-            def_label = "Test Event"
-            def_time = "1m"
-            
-        elif self.template in ["Internal", "SvS"]:
+        tpl = DM_TEMPLATES.get(self.template)
+        if tpl:
+            def_label = tpl.get("label")
+            def_time = tpl.get("time")
+
+        if self.template in ["Internal", "SvS"]:
             # Auto-Create Logic (Skip Modal)
             is_internal = (self.template == "Internal")
             ref_day = 14 if is_internal else 28
-            label_prefix = "Internal Castle [Battle]" if is_internal else "SvS Castle Battle"
+            label_prefix = str(tpl["label"])
             
             # Calculate next occurrence
             next_ts = get_next_cycle(2026, 2, ref_day, 12)
@@ -900,27 +1071,444 @@ class TimerWizardView(discord.ui.View):
              now = datetime.now(timezone.utc)
              target = now.replace(hour=23, minute=55, second=0, microsecond=0)
              if target <= now: target += timedelta(days=1)
-             def_label = "Arena Reset"
-             def_time = target.strftime("%Y-%m-%d %H:%M")
-             
-        elif self.template == "Bear":
-             def_label = "🐻 Bear Trap"
-             # def_time left blank
-             
-        elif self.template == "Joe":
-             def_label = "🤡 Crazy Joe"
-             # def_time left blank
-
-        if self.mode == "duration" or self.template == "Foundry": pass 
-        else:
-            # Keep blank if not set above
-            pass 
+             def_time = target.strftime("%Y-%m-%d %H:%M") 
             
+        user_tz = get_user_tz_str(interaction.user.id)
         modal = TimerDetailsModal(
-            self.mode, self.notify_method, self.role_id, 
+            self.mode, self.notify_method, self.role_id, user_tz,
             def_label, def_time, template_type=self.template
         )
         await interaction.response.send_modal(modal)
+
+# --- DM Setup Wizard Views ---
+
+async def start_dm_setup(user: discord.User, guild_id: int):
+    """Initiates the DM setup wizard for a user."""
+    user_setup_state[user.id] = {
+        "step": "awaiting_template",
+        "guild_id": guild_id,
+        "data": {
+            "label": None,
+            "end_epoch": None,
+            "recurrence_seconds": 0,
+            "reminders": [],
+            "event_duration": 900,
+            "notify_method": "⚠️ Message in Server (Ping @everyone)",
+            "role_id": None,
+            "description": None,
+            "template": None,
+        }
+    }
+    try:
+        dm = await user.create_dm()
+        # Build template select options
+        options = []
+        for key, tpl in DM_TEMPLATES.items():
+            options.append(discord.SelectOption(label=key, description=tpl["desc"], emoji=tpl["emoji"], value=key))
+        
+        view = DMSetupTemplateView(user.id, options)
+        await dm.send("**☁️ Chrono Setup Wizard**\n\nLet's set up a new alert step by step!\n\n**Step 1/5:** Choose a template or start Custom:", view=view)
+    except discord.Forbidden:
+        # User has DMs disabled
+        del user_setup_state[user.id]
+        return False
+    return True
+
+class DMSetupTemplateView(discord.ui.View):
+    def __init__(self, user_id: int, options: list):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        select = discord.ui.Select(placeholder="Choose a template...", options=options, row=0)
+        select.callback = self.on_select
+        self.add_item(select)
+        
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.red, row=1)
+        cancel_btn.callback = self.on_cancel
+        self.add_item(cancel_btn)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your setup!", ephemeral=True)
+            return
+        
+        template_key = interaction.data["values"][0]
+        state = user_setup_state.get(self.user_id)
+        if not state:
+            await interaction.response.send_message("❌ Setup expired. Please start again.", ephemeral=True)
+            return
+        
+        tpl = DM_TEMPLATES[template_key]
+        state["data"]["template"] = template_key
+        
+        # Auto-fill from template
+        if tpl.get("label"):
+            state["data"]["label"] = tpl["label"]
+        if tpl.get("recur"):
+            try:
+                state["data"]["recurrence_seconds"] = parse_duration_string(str(tpl["recur"])) if tpl["recur"] != "0" else 0
+            except: pass
+        if tpl.get("adv"):
+            try:
+                parts = str(tpl["adv"]).split('|')
+                if len(parts) >= 1 and parts[0].strip():
+                    state["data"]["event_duration"] = parse_duration_string(parts[0].strip())
+                if len(parts) >= 2 and parts[1].strip():
+                    state["data"]["reminders"] = parse_reminders_string(parts[1].strip())
+            except: pass
+        
+        # Disable the view
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        
+        # Auto-create for Internal/SvS (they have fixed cycle times)
+        if template_key in ["Internal", "SvS"]:
+            ref_day = 14 if template_key == "Internal" else 28
+            next_ts = get_next_cycle(2026, 2, ref_day, 12)
+            state["data"]["end_epoch"] = next_ts
+            state["data"]["recurrence_seconds"] = 2419200  # 28 days
+            state["data"]["reminders"] = [18000, 7200, 3600]
+            # Skip to notify step
+            state["step"] = "awaiting_notify"
+            await send_notify_step(interaction.user, state)
+            return
+        
+        # Arena auto-fills time
+        if template_key == "Arena":
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=23, minute=55, second=0, microsecond=0)
+            if target <= now: target += timedelta(days=1)
+            state["data"]["end_epoch"] = int(target.timestamp())
+        
+        # If template gave us a label, skip to time
+        if state["data"]["label"]:
+            if state["data"]["end_epoch"]:
+                # Both label and time set (Arena), go to reminders
+                state["step"] = "awaiting_reminders"
+                await interaction.channel.send("**Step 4/5:** Want early reminders?\nType reminder times separated by commas (e.g. `10m, 5m` or `1h, 30m`).\nReply **no** to skip.")
+            else:
+                state["step"] = "awaiting_time"
+                await interaction.channel.send(f"**Step 3/5:** When should **{state['data']['label']}** fire? (All times in **UTC**)\n*Examples:* `10m`, `1h 30m`, `14:00` (today), `2026-03-10`")
+        else:
+            state["step"] = "awaiting_label"
+            await interaction.channel.send("**Step 2/5:** What should we call this event?\n*Example:* `Server Restart`")
+
+    async def on_cancel(self, interaction: discord.Interaction):
+        if self.user_id in user_setup_state:
+            del user_setup_state[self.user_id]
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="❌ Setup cancelled.", view=self)
+
+async def send_notify_step(user: discord.User, state: dict):
+    """Sends the notification method selection step."""
+    state["step"] = "awaiting_notify"
+    options = [
+        discord.SelectOption(label="📢 Ping Role", value="role", description="Ping a specific role"),
+        discord.SelectOption(label="⚠️ Ping @everyone", value="everyone", description="Ping @everyone"),
+        discord.SelectOption(label="🔕 Silent", value="silent", description="No ping, just a message"),
+        discord.SelectOption(label="📩 DM Me", value="dm", description="Send alert to your DMs"),
+    ]
+    view = DMSetupNotifyView(user.id, options, state)
+    dm = await user.create_dm()
+    await dm.send("**Step 4/5:** How should I notify when this fires?", view=view)
+
+class DMSetupNotifyView(discord.ui.View):
+    def __init__(self, user_id: int, options: list, state: dict):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.state = state
+        select = discord.ui.Select(placeholder="Notification method...", options=options, row=0)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your setup!", ephemeral=True)
+            return
+        
+        choice = interaction.data["values"][0]
+        state = user_setup_state.get(self.user_id)
+        if not state:
+            await interaction.response.send_message("❌ Setup expired.", ephemeral=True)
+            return
+        
+        # Map choice to notify_method string
+        method_map = {
+            "role": "📢 Message in Server (Ping Role)",
+            "everyone": "⚠️ Message in Server (Ping @everyone)",
+            "silent": "🔕 Message in Server (Silent)",
+            "dm": "📩 DM Me",
+        }
+        state["data"]["notify_method"] = method_map.get(choice, "🔕 Message in Server (Silent)")
+        
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        
+        if choice == "role":
+            # Ask for role - use RoleSelect with guild context
+            guild = bot.get_guild(state["guild_id"])
+            if guild:
+                state["step"] = "awaiting_role"
+                view = DMSetupRoleView(self.user_id, state)
+                await interaction.channel.send("**Step 4b/5:** Which role should I ping?", view=view)
+                return
+        
+        # Skip to confirmation
+        await send_confirm_step(interaction.user, state)
+
+class DMSetupRoleView(discord.ui.View):
+    def __init__(self, user_id: int, state: dict):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.state = state
+        
+        # We can't use discord.ui.RoleSelect in DMs, so ask user to type role name
+        # Actually let's just list top roles as buttons or ask for ID
+        # Simplest: ask user to type the role name
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+async def send_confirm_step(user: discord.User, state: dict):
+    """Sends confirmation summary before creating the timer."""
+    state["step"] = "awaiting_confirm"
+    d = state["data"]
+    
+    # Build summary
+    label = d.get("label", "Unknown")
+    ts = d.get("end_epoch", 0)
+    recur = d.get("recurrence_seconds", 0)
+    reminders = d.get("reminders", [])
+    notify = d.get("notify_method", "Silent")
+    desc = d.get("description", "")
+    
+    summary = f"**Event:** {label}\n"
+    summary += f"**Fires:** <t:{ts}:F> (<t:{ts}:R>)\n"
+    if recur > 0:
+        summary += f"**Repeats:** {get_interval_str(recur)}\n"
+    if reminders:
+        rem_strs = [get_interval_str(r) for r in reminders]
+        summary += f"**Reminders:** {', '.join(rem_strs)} before\n"
+    summary += f"**Notify:** {notify}\n"
+    if desc:
+        summary += f"**Details:** {desc}\n"
+    
+    view = DMSetupConfirmView(user.id, state)
+    dm = await user.create_dm()
+    await dm.send(f"**Step 5/5:** Does this look right?\n\n{summary}", view=view)
+
+class DMSetupConfirmView(discord.ui.View):
+    def __init__(self, user_id: int, state: dict):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.state = state
+        
+        confirm_btn = discord.ui.Button(label="✅ Create Timer", style=discord.ButtonStyle.green, row=0)
+        confirm_btn.callback = self.on_confirm
+        self.add_item(confirm_btn)
+        
+        cancel_btn = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.red, row=0)
+        cancel_btn.callback = self.on_cancel
+        self.add_item(cancel_btn)
+
+    async def on_confirm(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your setup!", ephemeral=True)
+            return
+        
+        state = user_setup_state.get(self.user_id)
+        if not state:
+            await interaction.response.send_message("❌ Setup expired.", ephemeral=True)
+            return
+        
+        d = state["data"]
+        guild = bot.get_guild(state["guild_id"])
+        
+        if not guild:
+            await interaction.response.send_message("❌ Can't find the server anymore.", ephemeral=True)
+            del user_setup_state[self.user_id]
+            return
+        
+        await interaction.response.defer()
+        
+        # Create timer using add_timer_internal
+        await add_timer_internal(
+            guild,
+            d["label"],
+            d["end_epoch"],
+            d.get("role_id"),
+            d["notify_method"],
+            "smart",
+            d.get("recurrence_seconds", 0),
+            None,  # image
+            d.get("event_duration", 900),
+            d.get("reminders", []),
+            owner_id=interaction.user.id,
+            description=d.get("description")
+        )
+        
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(view=self)
+        
+        await interaction.channel.send(f"✅ **Timer Created!** `{d['label']}` is set in **{guild.name}**.")
+        
+        if self.user_id in user_setup_state:
+            del user_setup_state[self.user_id]
+
+    async def on_cancel(self, interaction: discord.Interaction):
+        if self.user_id in user_setup_state:
+            del user_setup_state[self.user_id]
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="❌ Setup cancelled.", view=self)
+
+async def handle_dm_setup_step(message: discord.Message):
+    """Handles text-based DM wizard steps."""
+    uid = message.author.id
+    state = user_setup_state.get(uid)
+    if not state: return
+    
+    content = message.content.strip()
+    step = state["step"]
+    
+    # Cancel keyword
+    if content.lower() == "cancel":
+        del user_setup_state[uid]
+        await message.channel.send("❌ Setup cancelled.")
+        return
+    
+    if step == "awaiting_label":
+        if len(content) < 1 or len(content) > 50:
+            await message.channel.send("❌ Label must be 1-50 characters. Try again:")
+            return
+        state["data"]["label"] = content
+        state["step"] = "awaiting_time"
+        await message.channel.send(f"Got it: **{content}**\n\n**Step 3/5:** When should it fire? (All times in **UTC**)\n*Examples:* `10m`, `1h 30m`, `14:00` (today), `2026-03-10`")
+    
+    elif step == "awaiting_time":
+        try:
+            result = parse_time_input(content, "smart")
+            if isinstance(result, tuple) and result[0] == "DATE_ONLY":
+                state["data"]["temp_date"] = result[1]
+                state["step"] = "awaiting_time_of_day"
+                await message.channel.send(f"📅 You entered the date **{result[1]}**.\nWhat time on that day should it fire? (**UTC Timezone**)\n*Examples:* `14:00`, `09:30`")
+                return
+                
+            end_epoch = result
+            state["data"]["end_epoch"] = end_epoch
+            state["step"] = "awaiting_reminders"
+            await message.channel.send(f"⏰ Set to <t:{end_epoch}:F> (<t:{end_epoch}:R>)\n\n**Step 4/5:** Want early reminders?\nType times separated by commas (e.g. `10m, 5m`) or reply **no** to skip.")
+        except ValueError as e:
+            await message.channel.send(f"❌ {str(e)}\nTry again (e.g. `10m`, `14:00`, `2026-03-10`):")
+
+    elif step == "awaiting_time_of_day":
+        # Combine the saved date and the new time
+        date_str = state["data"].get("temp_date")
+        combined_str = f"{date_str} {content}"
+        try:
+            end_epoch = parse_time_input(combined_str, "utc_custom")
+            state["data"]["end_epoch"] = end_epoch
+            if "temp_date" in state["data"]:
+                del state["data"]["temp_date"]
+            
+            state["step"] = "awaiting_reminders"
+            await message.channel.send(f"⏰ Set to <t:{end_epoch}:F> (<t:{end_epoch}:R>)\n\n**Step 4/5:** Want early reminders?\nType times separated by commas (e.g. `10m, 5m`) or reply **no** to skip.")
+        except ValueError:
+            await message.channel.send(f"❌ Invalid time format.\nTry again (e.g. `14:00`, `09:30`):")
+    
+    elif step == "awaiting_reminders":
+        if content.lower() in ["no", "none", "skip", "n"]:
+            state["step"] = "awaiting_recurrence"
+            # Check if template already set recurrence
+            if state["data"]["recurrence_seconds"] > 0:
+                # Skip to notify
+                await send_notify_step(message.author, state)
+            else:
+                await message.channel.send("**Step 5/5:** Should this repeat?\nType the interval (e.g. `24h`, `7d`) or reply **no** for one-time.")
+        else:
+            reminders = parse_reminders_string(content)
+            if reminders:
+                state["data"]["reminders"] = reminders
+                rem_strs = [get_interval_str(r) for r in reminders]
+                await message.channel.send(f"✅ Reminders set: {', '.join(rem_strs)} before.")
+            
+            # Check if template already set recurrence
+            if state["data"]["recurrence_seconds"] > 0:
+                await send_notify_step(message.author, state)
+            else:
+                state["step"] = "awaiting_recurrence"
+                await message.channel.send("**Step 5/5:** Should this repeat?\nType the interval (e.g. `24h`, `7d`) or reply **no** for one-time.")
+    
+    elif step == "awaiting_recurrence":
+        if content.lower() in ["no", "none", "skip", "n", "0"]:
+            state["data"]["recurrence_seconds"] = 0
+        else:
+            try:
+                recur = parse_duration_string(content)
+                state["data"]["recurrence_seconds"] = recur
+                await message.channel.send(f"🔄 Repeats every {get_interval_str(recur)}.")
+            except ValueError as e:
+                await message.channel.send(f"❌ {str(e)}\nTry again (e.g. `24h`, `7d`) or reply **no**:")
+                return
+        
+        await send_notify_step(message.author, state)
+    
+    elif step == "awaiting_role":
+        # User types a role name, we try to find it in the guild
+        guild = bot.get_guild(state["guild_id"])
+        if guild:
+            # Try to find role by name (case-insensitive)
+            found_role = None
+            for role in guild.roles:
+                if role.name.lower() == content.lower():
+                    found_role = role
+                    break
+            
+            if found_role:
+                state["data"]["role_id"] = found_role.id
+                await message.channel.send(f"✅ Will ping **{found_role.name}**.")
+                await send_confirm_step(message.author, state)
+            elif content.lower() == "skip":
+                state["data"]["notify_method"] = "🔕 Message in Server (Silent)"
+                state["data"]["role_id"] = None
+                await message.channel.send("✅ Skipping role ping.")
+                await send_confirm_step(message.author, state)
+            else:
+                # List available roles to help
+                role_names = [r.name for r in guild.roles if not r.is_default() and not r.is_bot_managed()][:15]
+                roles_str = ", ".join(f"`{r}`" for r in role_names)
+                await message.channel.send(f"❌ Role not found. Available roles: {roles_str}\nType the exact role name, or reply **skip** to continue without pinging a role.")
+        else:
+            await message.channel.send("❌ Can't find the server.")
+            del user_setup_state[uid]
+
+
+class DMWizardStartView(discord.ui.View):
+    """Ephemeral view to choose between DM wizard or classic menu."""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+    
+    @discord.ui.button(label="💬 Setup via DM (Recommended)", style=discord.ButtonStyle.green, row=0)
+    async def dm_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        success = await start_dm_setup(interaction.user, self.guild_id)
+        if success:
+            await interaction.followup.send("📩 Check your DMs! I've sent you a setup wizard.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ I can't DM you. Please enable DMs from server members in your privacy settings, or use the classic menu.", ephemeral=True)
+    
+    @discord.ui.button(label="🪟 Classic Menu", style=discord.ButtonStyle.gray, row=0)
+    async def classic_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        is_dm = interaction.guild is None
+        await interaction.response.send_message(
+            "**☁️ Chrono Dashboard**\nSet up a new alert:",
+            view=TimerWizardView(is_dm=is_dm), ephemeral=True
+        )
+
 
 class DashboardView(discord.ui.View):
     def __init__(self):
@@ -929,10 +1517,18 @@ class DashboardView(discord.ui.View):
     @discord.ui.button(label="  ➕ New Alert  ", style=discord.ButtonStyle.blurple, custom_id="btn_yeti_new")
     async def new_operation(self, interaction: discord.Interaction, button: discord.ui.Button):
         is_dm = interaction.guild is None
-        await interaction.response.send_message(
-            "**☁️ Chrono Dashboard**\nSet up a new alert:",
-            view=TimerWizardView(is_dm=is_dm), ephemeral=True
-        )
+        if is_dm:
+            # In DMs, go straight to classic menu
+            await interaction.response.send_message(
+                "**☁️ Chrono Dashboard**\nSet up a new alert:",
+                view=TimerWizardView(is_dm=True), ephemeral=True
+            )
+        else:
+            # In server, offer DM or Classic
+            await interaction.response.send_message(
+                "**☁️ New Alert**\nChoose your setup method:",
+                view=DMWizardStartView(guild_id=interaction.guild_id), ephemeral=True
+            )
 
     @discord.ui.button(label="  ⚙️ Manage Alerts  ", style=discord.ButtonStyle.gray, custom_id="btn_yeti_manage")
     async def manage_active(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1165,14 +1761,18 @@ async def refresh(ctx):
     """Refreshes the dashboard by deleting the old one and sending a new one (Force Pin)."""
     data = load_data()
     guild_id = str(ctx.guild.id)
-    if guild_id in data:
-        await ctx.send("🔄 **Refreshing Dashboard...**")
-        await update_dashboard(ctx.guild, data[guild_id], resend=True)
-        # Delete the trigger command and confirmation to keep chat clean
-        try: await ctx.message.delete() 
-        except: pass
+    
+    await ctx.send("🔄 **Refreshing Dashboard...**")
+    if guild_id not in data or "dashboard_message_id" not in data[guild_id]:
+        # Auto-setup if missing
+        await run_setup(ctx.guild, ctx.channel)
+        await ctx.send("✅ Dashboard initialized.")
     else:
-        await ctx.send("❌ No dashboard found. Use `!start` first.")
+        await update_dashboard(ctx.guild, data[guild_id], resend=True)
+        
+    # Delete the trigger command and confirmation to keep chat clean
+    try: await ctx.message.delete() 
+    except: pass
 
 @bot.tree.command(name="refresh", description="Force Refresh & Pin Dashboard")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1180,11 +1780,12 @@ async def refresh_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     data = load_data()
     guild_id = str(interaction.guild_id)
-    if guild_id in data:
+    if guild_id in data and "dashboard_message_id" in data[guild_id]:
         await update_dashboard(interaction.guild, data[guild_id], resend=True)
         await interaction.followup.send("✅ **Dashboard Refreshed & Pinned!**", ephemeral=True)
     else:
-        await interaction.followup.send("❌ No dashboard found. Use `/start` first.", ephemeral=True)
+        await run_setup(interaction.guild, interaction.channel)
+        await interaction.followup.send("✅ **Dashboard Initialized & Pinned!**", ephemeral=True)
 
 @bot.command()
 async def sync(ctx):
@@ -1204,169 +1805,299 @@ async def sync(ctx):
     except Exception as e:
         await ctx.send(f"❌ Sync failed: {e}")
 
-@bot.tree.command(name="timer", description="Quickly set a timer")
+async def parse_natural_language_groq(text: str) -> dict:
+    if not groq_client:
+        raise ValueError("Groq API Key is not configured.")
+        
+    prompt = f"""
+    You are an AI assistant for a discord reminder bot specifically optimized for the mobile game "Whiteout Survival".
+    Extract the intent and timing from the user's natural language request.
+    
+    User Request: "{text}"
+    
+    CRITICAL INSTRUCTIONS:
+    1. Action: Determine if the user wants to "create" a timer, "edit" an existing one, "delete" (cancel/remove) one, "add_manager", "remove_manager", or "set_cycle".
+    2. Languages: You must perfectly understand requests in ANY language (Spanish, French, Arabic, etc.), but ALWAYS translate the event name (Label) into standard English.
+    3. Custom Events: If they specify a custom event name not listed below, use exactly what they typed (translated to English).
+    4. Roles: If they mention pinging/tagging a specific role (like "@North America", "ping R4", "tag the alliance"), extract that role's name WITHOUT the '@'.
+    5. PMs/DMs: If they ask to "PM all" or "DM me" AND tag a role, set notify_method to "both". If just DM, "dm". If just role/channel, "channel".
+    6. Early Reminders: If they say "ping on time of event and 5 mins before", extract "5m" into the reminders_string.
+    7. Managers: If they ask to add or remove someone from the timing managers list, extract the name/tag into `target_role`.
+    8. Set Cycle: If they want to setup an automatic cycle for an event (e.g. "I have foundry on this friday voting starts on tuesday and ends on wednesday" or "set cycle for foundry every 14 days, voting is next monday for 24h"), use action="set_cycle". `time_string` should be when Voting Starts, `duration_string` should be how long voting lasts (e.g. "24h" or "48h" based on start/end days), and `interval_string` should be the cycle repeat frequency.
+    
+    CRITICAL GAME KNOWLEDGE FOR DEFAULTS (Apply these if the user doesn't specify otherwise):
+    - "Bear Trap" or "Bear": Label="🐻 Bear Trap", default interval="47h 30m", default early reminders="30m, 5m"
+    - "Crazy Joe" or "Joe": Label="🤡 Crazy Joe", default interval="0", default early reminders="40m, 5m"
+    - "Arena": Label="🛡️ Arena Reset", default interval="24h", default early reminders="5m"
+    - "Castle" or "Sunfire": Label="🏰 Castle Battle", default interval="28d", default early reminders="5h, 1h"
+    - "SvS": Label="⚔️ SvS Battle", default interval="28d", default early reminders="5h, 1h"
+    
+    Respond ONLY with a valid JSON object matching this structure (no markdown tags):
+    {{
+      "action": "create", // or "edit", "delete", "add_manager", "remove_manager", "set_cycle"
+      "label": "The name of the event (use standard game emojis if matching defaults, otherwise use their exact string in English).",
+      "time_string": "The extracted time string (e.g., '10m', '1h', '14:00'). For 'delete' actions, leave empty.",
+      "duration_string": "Only used for set_cycle (e.g. '24h', '48h'). Empty otherwise.",
+      "interval_string": "The extracted repeat interval (e.g., '24h'). Use '0' if it doesn't repeat.",
+      "reminders_string": "Any early reminders mentioned (e.g., '10m, 5m').",
+      "target_role": "The name of the role they want to ping, or the name of the user to add to managers. Leave empty if not specified.",
+      "notify_method": "channel" // or "dm" or "both"
+    }}
+    
+    Example 1: "Remind me everyother day about beartrap at 14:00 UTC and tag role @North America"
+    Output: {{"action": "create", "label": "🐻 Bear Trap", "time_string": "14:00 UTC", "duration_string": "", "interval_string": "48h", "reminders_string": "30m, 5m", "target_role": "North America", "notify_method": "channel"}}
+    
+    Example 2: "PM all and mention role R4 for Castle in 2h"
+    Output: {{"action": "create", "label": "🏰 Castle Battle", "time_string": "2h", "duration_string": "", "interval_string": "28d", "reminders_string": "5h, 1h", "target_role": "R4", "notify_method": "both"}}
+    
+    Example 3: "Elimina mi recordatorio de trampa de osos"
+    Output: {{"action": "delete", "label": "🐻 Bear Trap", "time_string": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+
+    Example 4: "Add @John to the timing managers"
+    Output: {{"action": "add_manager", "label": "", "time_string": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "John", "notify_method": "channel"}}
+
+    Example 5: "I have foundry on this friday voting starts on tuesday and ends on wednesday. repeats every 2 weeks."
+    Output: {{"action": "set_cycle", "label": "Foundry", "time_string": "Tuesday", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+    """
+    
+    try:
+        completion = await groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="openai/gpt-oss-20b",
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        content = completion.choices[0].message.content
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"Groq parsing error: {e}")
+        raise ValueError("Failed to understand the request.")
+
+@bot.tree.command(name="chrono", description="Universal AI Engine: Manage events, timers, and cycles (e.g. 'Set Foundry to 14:00')")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    label="Name of the event", 
-    time="Time string (e.g. 10m, 14:00)",
-    role="Role to ping (optional)",
-    image="Upload an image/GIF",
-    image_link="Paste an image/GIF URL",
-    interval="Repeat interval (e.g. 24h)",
-    duration="Event Duration (Optional, def: 15m)",
-    reminders="Early reminders (e.g. '10m, 5m')"
-)
-async def timer_slash(interaction: discord.Interaction, label: str, time: str, role: discord.Role = None, image: discord.Attachment = None, image_link: str = None, interval: str = None, duration: str = None, reminders: str = None):
+@app_commands.describe(request="Your request (e.g. 'Move Bear Trap to 14:00', 'Cancel Castle', 'Ping @R4 for Joe')")
+async def remind_slash(interaction: discord.Interaction, request: str):
     await interaction.response.defer(ephemeral=True)
     try:
-        end_epoch = parse_time_input(time, "smart")
+        parsed = await parse_natural_language_groq(request)
+        action = parsed.get("action", "create").lower()
+        label = parsed.get("label", "Reminder")
+        
+        # 1. MANAGER ACTIONS
+        if action in ["add_manager", "remove_manager"]:
+            if not interaction.guild:
+                await interaction.followup.send("❌ Timing managers are only available in Servers.", ephemeral=True)
+                return
+            if not interaction.user.guild_permissions.administrator and interaction.user.id != interaction.guild.owner_id:
+                await interaction.followup.send("❌ Only Server Administrators can manage the Timing Managers list.", ephemeral=True)
+                return
+            
+            target_name = parsed.get("target_role", "").lower().strip()
+            if not target_name:
+                await interaction.followup.send("❌ I couldn't understand who you wanted to add/remove.", ephemeral=True)
+                return
+                
+            # Find the user
+            target_member = discord.utils.find(lambda m: target_name in m.name.lower() or target_name in m.display_name.lower(), interaction.guild.members)
+            if not target_member:
+                await interaction.followup.send(f"❌ Could not find a member matching `{target_name}`.", ephemeral=True)
+                return
+                
+            data = load_data()
+            context_id = str(interaction.guild_id)
+            if context_id not in data: data[context_id] = {}
+            if "timing_managers" not in data[context_id]: data[context_id]["timing_managers"] = []
+            
+            mgrs = data[context_id]["timing_managers"]
+            
+            if action == "add_manager":
+                if target_member.id not in mgrs:
+                    mgrs.append(target_member.id)
+                    save_data(data)
+                    await interaction.followup.send(f"✅ **{target_member.display_name}** has been added to the Timing Managers list.", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"⚠️ **{target_member.display_name}** is already a Timing Manager.", ephemeral=True)
+            else:
+                if target_member.id in mgrs:
+                    mgrs.remove(target_member.id)
+                    save_data(data)
+                    await interaction.followup.send(f"✅ **{target_member.display_name}** has been removed from the Timing Managers list.", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"⚠️ **{target_member.display_name}** is not in the Timing Managers list.", ephemeral=True)
+            return
+
+        # 1.5 SET CYCLE ACTION
+        if action == "set_cycle":
+            if not interaction.guild:
+                await interaction.followup.send("❌ Event cycles are only available in Servers.", ephemeral=True)
+                return
+            if not interaction.user.guild_permissions.administrator and interaction.user.id != interaction.guild.owner_id:
+                await interaction.followup.send("❌ Only Server Administrators can manage Event Cycles.", ephemeral=True)
+                return
+                
+            user_tz = get_user_tz_str(interaction.user.id)
+            time_str = parsed.get("time_string", "")
+            duration_str = parsed.get("duration_string", "24h")
+            interval_str = parsed.get("interval_string", "14d")
+            
+            if not time_str:
+                await interaction.followup.send("❌ I couldn't determine the voting start time.", ephemeral=True)
+                return
+                
+            start_epoch = parse_time_input(time_str, "smart", user_tz)
+            # Default to 24h duration and 14d interval if parse fails or empty
+            try: duration_sec = parse_duration_string(duration_str) if duration_str else 86400
+            except: duration_sec = 86400
+            try: interval_sec = parse_duration_string(interval_str) if interval_str else 1209600
+            except: interval_sec = 1209600
+            
+            data = load_data()
+            context_id = str(interaction.guild_id)
+            if context_id not in data: data[context_id] = {}
+            if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
+            
+            cycles = data[context_id]["cycles"]
+            cycle = next((c for c in cycles if c['name'].lower() == label.lower()), None)
+            if cycle:
+                cycle['start_epoch'] = start_epoch
+                cycle['duration_sec'] = duration_sec
+                cycle['interval_sec'] = interval_sec
+                cycle['pre_dm_sent'] = False
+                cycle['post_dm_sent'] = False
+                await interaction.followup.send(f"✅ Updated event cycle **{label}**.", ephemeral=True)
+            else:
+                cycles.append({
+                    "name": label,
+                    "start_epoch": start_epoch,
+                    "duration_sec": duration_sec,
+                    "interval_sec": interval_sec,
+                    "pre_dm_sent": False,
+                    "post_dm_sent": False
+                })
+                await interaction.followup.send(f"✅ Created event cycle **{label}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+                
+            save_data(data)
+            return
+
+        # 2. DELETE ACTION
+        if action == "delete":
+            data = load_data()
+            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+            if context_id in data and "timers" in data[context_id]:
+                for idx, t in enumerate(data[context_id]["timers"]):
+                    if t['label'].lower() == label.lower():
+                        if not check_permissions(interaction, t['owner_id']):
+                            await interaction.followup.send("❌ **Access Denied.** You can only delete your own timers.", ephemeral=True); return
+                        removed = data[context_id]["timers"].pop(idx)
+                        if removed.get("discord_event_id") and interaction.guild:
+                            await delete_discord_event(interaction.guild, removed["discord_event_id"])
+                        save_data(data)
+                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
+                        await interaction.followup.send(f"✅ Deleted timer **{label}**.", ephemeral=True)
+                        return
+            await interaction.followup.send(f"❌ Timer **{label}** not found to delete.", ephemeral=True)
+            return
+
+        # Time Parsing for Create/Edit
+        user_tz = get_user_tz_str(interaction.user.id)
+        time_str = parsed.get("time_string", "")
+        if not time_str: raise ValueError("Could not determine a time.")
+        end_epoch = parse_time_input(time_str, "smart", user_tz)
+        
+        recurrence_seconds = 0
+        interval_str = parsed.get("interval_string", "0")
+        if interval_str and str(interval_str) != "0":
+            try: recurrence_seconds = parse_duration_string(str(interval_str))
+            except: pass
+            
+        reminders_list = []
+        reminders_str = parsed.get("reminders_string")
+        if reminders_str:
+            reminders_list = parse_reminders_string(str(reminders_str))
+            
+        # 2. EDIT ACTION
+        if action == "edit":
+            data = load_data()
+            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+            if context_id in data and "timers" in data[context_id]:
+                for t in data[context_id]["timers"]:
+                    if t['label'].lower() == label.lower():
+                        if not check_permissions(interaction, t['owner_id']):
+                            await interaction.followup.send("❌ **Access Denied.** You can only edit your own timers.", ephemeral=True); return
+                        
+                        t["end_epoch"] = end_epoch
+                        t["start_epoch"] = int(time.time())
+                        t["sent_reminders"] = []
+                        if recurrence_seconds: t["recurrence_seconds"] = recurrence_seconds
+                        if reminders_list: t["reminders"] = reminders_list
+                        
+                        if t.get("discord_event_id") and interaction.guild:
+                             await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t["end_epoch"], t.get("event_duration", 900))
+                        
+                        data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
+                        save_data(data)
+                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
+                        await interaction.followup.send(f"✅ Updated timer **{label}** to new time.", ephemeral=True)
+                        return
+            await interaction.followup.send(f"❌ Timer **{label}** not found to edit.", ephemeral=True)
+            return
+
+        # 3. CREATE ACTION
+        # Role & Permissions Logic
+        target_role_str = parsed.get("target_role", "")
+        role_id = None
+        notify_str = parsed.get("notify_method", "channel")
+        
+        if notify_str == "both": notify_method = "📣 Both (Ping & DM)"
+        elif notify_str == "dm": notify_method = "📩 DM Me"
+        else: notify_method = "📢 Message in Server (Ping Role)"
+        
+        if not interaction.guild:
+            notify_method = "📩 DM Me"
+        elif target_role_str:
+            # Fuzzy match role
+            for r in interaction.guild.roles:
+                if target_role_str.lower() in r.name.lower():
+                    # Check hierarchy/permissions
+                    if interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_roles or interaction.user.top_role.position > r.position:
+                        role_id = r.id
+                    else:
+                        await interaction.followup.send(f"⚠️ You lack permissions to ping the **{r.name}** role. Reverting to channel alert without ping.", ephemeral=True)
+                    break
+            
+        await add_timer(interaction, label, end_epoch, role_id, notify_method, "smart", recurrence_seconds, None, 900, reminders_list)
+        
     except ValueError as e:
         await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
-        return
-    
-    recurrence_seconds = 0
-    if interval:
-       try: recurrence_seconds = parse_duration_string(interval)
-       except: pass
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    event_duration_sec = 900 # 15 min default
-    if duration:
-        try: event_duration_sec = parse_duration_string(duration)
-        except: pass
-    
-    reminders_list = []
-    if reminders:
-        reminders_list = parse_reminders_string(reminders)
-
-    final_image = None
-    if image: final_image = image.url
-    elif image_link: final_image = image_link
-    
-    role_id = role.id if role else None
-    notify_method = "📢 Message in Server (Ping Role)" 
-    
-    await add_timer(interaction, label, end_epoch, role_id, notify_method, "smart", recurrence_seconds, final_image, event_duration_sec, reminders_list)
-
-@bot.tree.command(name="edit", description="Edit an existing timer by label")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(
-    label="Exact name of the timer",
-    new_time="New time string (optional)",
-    new_image="New image/GIF URL or 'none' (optional)",
-    new_interval="New interval e.g. 24h or '0' (optional)",
-    new_image_file="Upload a new image file",
-    new_duration="New Event Duration (Optional)",
-    new_reminders="New Reminders e.g. '10m, 5m' (Optional)"
-)
-@app_commands.autocomplete(label=timer_autocomplete)
-async def edit_slash(interaction: discord.Interaction, label: str, new_time: str = None, new_image: str = None, new_interval: str = None, new_image_file: discord.Attachment = None, new_duration: str = None, new_reminders: str = None):
-    await interaction.response.defer(ephemeral=True)
-    data = load_data()
-    # Context
-    context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
-    
-    if context_id not in data or "timers" not in data[context_id]:
-        await interaction.followup.send("❌ No timers found.", ephemeral=True); return
-
-    found = False
-    for t in data[context_id]["timers"]:
-        if t['label'].lower() == label.lower():
-            # Security Check
-            if not check_permissions(interaction, t['owner_id']):
-                await interaction.followup.send("❌ **Access Denied.** You can only edit your own timers.", ephemeral=True)
-                return
-
-            try:
-                if new_time:
-                    t["end_epoch"] = parse_time_input(new_time, "smart")
-                    t["start_epoch"] = int(time.time())
-                    t["sent_reminders"] = [] # Reset reminders
-                if new_interval:
-                    if new_interval == "0": t["recurrence_seconds"] = 0
-                    else: t["recurrence_seconds"] = parse_duration_string(new_interval)
-                
-                if new_image_file:
-                     t["image_url"] = new_image_file.url
-                elif new_image:
-                    if new_image.lower() == "none":
-                        if "image_url" in t: del t["image_url"]
-                    else:
-                         t["image_url"] = new_image
-
-                if new_duration:
-                    t["event_duration"] = parse_duration_string(new_duration)
-                if new_reminders:
-                    t["reminders"] = parse_reminders_string(new_reminders)
-                    t["sent_reminders"] = [] 
-                
-                # Sync Event (Only Guild)
-                if t.get("discord_event_id") and interaction.guild:
-                     dur = t.get("event_duration", 900)
-                     await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t["end_epoch"], dur)
-                
-                found = True
-                break
-            except ValueError:
-                await interaction.followup.send("❌ Invalid input format.", ephemeral=True); return
-    
-    if found:
-        data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
-        save_data(data)
-        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
-        await interaction.followup.send(f"✅ Updated timer **{label}**.", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ Timer **{label}** not found.", ephemeral=True)
-
-@bot.tree.command(name="delete", description="Delete an existing timer")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(label="Name of the timer to delete")
-@app_commands.autocomplete(label=timer_autocomplete)
-async def delete_slash(interaction: discord.Interaction, label: str):
-    await interaction.response.defer(ephemeral=True)
-    data = load_data()
-    context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
-    
-    if context_id in data and "timers" in data[context_id]:
-        for idx, t in enumerate(data[context_id]["timers"]):
-            if t['label'] == label:
-                # Security Check
-                if not check_permissions(interaction, t['owner_id']):
-                    await interaction.followup.send("❌ **Access Denied.** You can only delete your own timers.", ephemeral=True)
-                    return
-
-                removed = data[context_id]["timers"].pop(idx)
-                
-                if removed.get("discord_event_id") and interaction.guild:
-                    await delete_discord_event(interaction.guild, removed["discord_event_id"])
-                    
-                save_data(data)
-                if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
-                await interaction.followup.send(f"✅ Deleted timer **{label}**.", ephemeral=True)
-                return
-    
-    await interaction.followup.send(f"❌ Timer **{label}** not found.", ephemeral=True)
 
 @bot.tree.command(name="dashboard", description="Create or Move the Chrono Dashboard")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def dashboard(interaction: discord.Interaction):
-    # Context ID
-    context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
-    is_dm = interaction.guild is None
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ The live dashboard is not supported in DMs. Please use `/mytimers` instead to view your personal timers.", ephemeral=True)
+        return
 
+    # Defer the response immediately to prevent timeout
+    await interaction.response.defer(ephemeral=False)
+    
+    # Context ID
+    context_id = str(interaction.guild_id)
+    is_dm = False
     data = load_data()
     if context_id not in data: data[context_id] = {}
     
-    embed = discord.Embed(title="🌩️ Stratus Timers", color=discord.Color.dark_theme())
-    embed.description = "No active timers."
+    embed = discord.Embed(title="☁️ Chrono Dashboard", color=discord.Color.from_rgb(47, 49, 54))
+    embed.description = "*☁️ Chrono Silent - No Active Operations*"
     
     # Send new dashboard
     view = DashboardView()
-    # Use interaction response directly (User App Safe)
-    await interaction.response.send_message(embed=embed, view=view)
+    # Use followup since we already deferred
+    msg = await interaction.followup.send(embed=embed, view=view, wait=True)
     msg = await interaction.original_response()
     # Pin if possible (might fail in User App contexts, that's okay)
     try: 
@@ -1386,6 +2117,88 @@ async def dashboard(interaction: discord.Interaction):
     # Force Update (if guild)
     if not is_dm: await update_dashboard(interaction.guild, data[context_id], resend=True)
 
+@bot.tree.command(name="mytimers", description="View your active personal timers in DMs")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def mytimers(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+    data = load_data()
+    
+    if context_id not in data or "timers" not in data[context_id] or not data[context_id]["timers"]:
+        await interaction.followup.send("You have no active timers.", ephemeral=True)
+        return
+        
+    timers = data[context_id]["timers"]
+    user_timers = [t for t in timers if t['owner_id'] == interaction.user.id or not interaction.guild]
+    
+    if not user_timers:
+        await interaction.followup.send("You have no active timers.", ephemeral=True)
+        return
+        
+    embed = discord.Embed(title="⏱️ Your Active Timers", color=discord.Color.blue())
+    desc = ""
+    for idx, t in enumerate(user_timers, 1):
+        time_left = max(0, t['end_epoch'] - int(time.time()))
+        mins, secs = divmod(time_left, 60)
+        hrs, mins = divmod(mins, 60)
+        time_str = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m {secs}s"
+        desc += f"**{idx}. {t['label']}** - Ends in: {time_str} (<t:{t['end_epoch']}:R>)\n"
+        
+    embed.description = desc
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="set_cycle", description="Set up a recurring Global Event (e.g. Foundry) to automatically DM managers to schedule it.")
+@app_commands.allowed_installs(guilds=True)
+@app_commands.allowed_contexts(guilds=True)
+@app_commands.describe(
+    event_name="Name of the event (e.g. 'Foundry')",
+    voting_start="When does voting open? (e.g. 'Tomorrow 10:00')",
+    voting_duration="How long is voting? (e.g. '24h', '48h')",
+    interval="Cycle recurrence (e.g. '14d', '28d')"
+)
+async def set_cycle(interaction: discord.Interaction, event_name: str, voting_start: str, voting_duration: str, interval: str):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator and interaction.user.id != interaction.guild.owner_id:
+        await interaction.followup.send("❌ Only Server Administrators can manage Event Cycles.", ephemeral=True)
+        return
+        
+    try:
+        user_tz = get_user_tz_str(interaction.user.id)
+        start_epoch = parse_time_input(voting_start, "smart", user_tz)
+        duration_sec = parse_duration_string(voting_duration)
+        interval_sec = parse_duration_string(interval)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error parsing inputs: {e}", ephemeral=True)
+        return
+        
+    data = load_data()
+    context_id = str(interaction.guild_id)
+    if context_id not in data: data[context_id] = {}
+    if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
+    
+    # Update or add cycle
+    cycles = data[context_id]["cycles"]
+    cycle = next((c for c in cycles if c['name'].lower() == event_name.lower()), None)
+    if cycle:
+        cycle['start_epoch'] = start_epoch
+        cycle['duration_sec'] = duration_sec
+        cycle['interval_sec'] = interval_sec
+        cycle['pre_dm_sent'] = False
+        cycle['post_dm_sent'] = False
+        await interaction.followup.send(f"✅ Updated event cycle **{event_name}**.", ephemeral=True)
+    else:
+        cycles.append({
+            "name": event_name,
+            "start_epoch": start_epoch,
+            "duration_sec": duration_sec,
+            "interval_sec": interval_sec,
+            "pre_dm_sent": False,
+            "post_dm_sent": False
+        })
+        await interaction.followup.send(f"✅ Created event cycle **{event_name}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+        
+    save_data(data)
 
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
@@ -1627,13 +2440,13 @@ async def execute_dice(interaction: discord.Interaction):
             embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
             await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="dice", description="Roll a 6-sided dice")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
+# @bot.tree.command(name="dice", description="Roll a 6-sided dice")
+# @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+# @app_commands.allowed_installs(guilds=True, users=True)
 async def dice_slash(interaction: discord.Interaction):
     await execute_dice(interaction)
 
-active_targeted_rps = {}
+active_targeted_rps: dict[str, Any] = {}
 
 class RPSChallengeView(discord.ui.View):
     def __init__(self, match_id: str):
@@ -1822,14 +2635,14 @@ async def resolve_rps_match(msg: discord.Message, match_id: str, p1_choice: str 
         except:
             pass
 
-@bot.tree.command(name="rps", description="Challenge a user or the bot to Rock, Paper, Scissors!")
-@app_commands.describe(target="The user to challenge (leave empty for Bot)", mode="How to play (Selection or Random)")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="Selection (Pick moves)", value="Selection"),
-    app_commands.Choice(name="Random (Auto RNG)", value="Random")
-])
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=True)
+# @bot.tree.command(name="rps", description="Challenge a user or the bot to Rock, Paper, Scissors!")
+# @app_commands.describe(target="The user to challenge (leave empty for Bot)", mode="How to play (Selection or Random)")
+# @app_commands.choices(mode=[
+#     app_commands.Choice(name="Selection (Pick moves)", value="Selection"),
+#     app_commands.Choice(name="Random (Auto RNG)", value="Random")
+# ])
+# @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+# @app_commands.allowed_installs(guilds=True, users=True)
 async def rps_slash(interaction: discord.Interaction, target: discord.Member = None, mode: app_commands.Choice[str] = None):
     match_id = f"{interaction.id}"
     chosen_mode = mode.value if mode else "Selection"
@@ -1872,7 +2685,7 @@ async def rps_slash(interaction: discord.Interaction, target: discord.Member = N
 
 
 
-active_brawls = {}
+active_brawls: dict[str, Any] = {}
 
 class BrawlJoinView(discord.ui.View):
     def __init__(self, message_id: str):
@@ -2088,10 +2901,37 @@ async def resolve_brawl_round(msg: discord.Message, message_id: str, round_num: 
     try: await msg.edit(content=None, embed=embed, view=view)
     except: pass
 
-@bot.tree.command(name="brawl", description="Start a multiplayer RPS Brawl!")
-@app_commands.describe(max_rounds="Number of rounds (Default 3, Max 10)")
-@app_commands.allowed_contexts(guilds=True)
-async def brawl_slash(interaction: discord.Interaction, max_rounds: app_commands.Range[int, 1, 10] = 3):
+async def tz_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    choices = [app_commands.Choice(name="UTC", value="UTC")]
+    
+    # Filter available zones
+    matched = []
+    current_lower = current.lower()
+    for z in zoneinfo.available_timezones():
+        if current_lower in z.lower():
+
+            matched.append(app_commands.Choice(name=z, value=z))
+            
+    matched.sort(key=lambda x: x.name)
+    choices.extend(matched)
+    return choices[:25]
+
+@bot.tree.command(name="set_timezone", description="Set your local timezone for perfect timer creation!")
+@app_commands.autocomplete(timezone=tz_autocomplete)
+@app_commands.describe(timezone="Search for your timezone (e.g., 'Asia/Kolkata', 'America/New_York', 'UTC')")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def set_timezone_slash(interaction: discord.Interaction, timezone: str):
+    success = set_user_tz_str(interaction.user.id, timezone)
+    if success:
+        await interaction.response.send_message(f"✅ Your timezone has been secured as **{timezone}**!\n\nWhen you create timers via DM or the Command Menu, I will now assume the time you type belongs to this timezone instead of raw UTC. Easy!", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Failed to set timezone. Please type a valid timezone like 'America/New_York' or 'Asia/Kolkata'. You provided: {timezone}", ephemeral=True)
+
+# @bot.tree.command(name="brawl", description="Start a multiplayer RPS Brawl!")
+# @app_commands.describe(max_rounds="Number of rounds (Default 3, Max 10)")
+# @app_commands.allowed_contexts(guilds=True)
+# async def brawl_slash(interaction: discord.Interaction, max_rounds: app_commands.Range[int, 1, 10] = 3):
     message_id = f"{interaction.id}"
     
     active_brawls[message_id] = {
@@ -2115,8 +2955,108 @@ async def brawl_slash(interaction: discord.Interaction, max_rounds: app_commands
 async def on_message(message):
     if message.author.bot: return
     
-    # DM Handler for Foundry
+    # NLP Bot Mention Listener
+    if bot.user in message.mentions:
+        # Check if the message has "remind" or similar intent (optional but good)
+        content_no_mentions = message.content.replace(f'<@{bot.user.id}>', '').strip()
+        if content_no_mentions:
+            try:
+                # We can't easily defer an on_message like an interaction, so we send a thinking message
+                msg = await message.reply("⏳ Thinking...")
+                parsed = await parse_natural_language_groq(content_no_mentions)
+                user_tz = get_user_tz_str(message.author.id)
+                
+                time_str = parsed.get("time_string", "")
+                if not time_str: raise ValueError("Could not determine a time.")
+                
+                end_epoch = parse_time_input(time_str, "smart", user_tz)
+                
+                recurrence_seconds = 0
+                interval_str = parsed.get("interval_string", "0")
+                if interval_str and interval_str != "0":
+                    try: recurrence_seconds = parse_duration_string(interval_str)
+                    except: pass
+                    
+                reminders_list = []
+                reminders_str = parsed.get("reminders_string")
+                if reminders_str:
+                    reminders_list = parse_reminders_string(reminders_str)
+                    
+                label = parsed.get("label", "Reminder")
+                notify_method = "📢 Message in Server (Ping Role)" if message.guild else "📩 DM Me"
+                
+                owner_id = message.author.id
+                
+                await add_timer_internal(message.guild, label, end_epoch, None, notify_method, "smart", recurrence_seconds, None, 900, reminders_list, owner_id=owner_id)
+                
+                ts = int(end_epoch)
+                embed = discord.Embed(title="✅ Timer Set (NLP)", color=discord.Color.green())
+                desc = f"**{label}**\n📅 <t:{ts}:F> (<t:{ts}:R>)\n"
+                if recurrence_seconds > 0:
+                    desc += f"🔄 Repeats: {get_interval_str(recurrence_seconds)}\n"
+                embed.description = desc
+                await msg.edit(content=None, embed=embed)
+                
+            except ValueError as e:
+                await msg.edit(content=f"❌ {str(e)}")
+            except Exception as e:
+                logger.error(f"NLP error: {e}")
+                await msg.edit(content=f"❌ An error occurred parsing that.")
+    
+    # DM Handlers
     if isinstance(message.channel, discord.DMChannel):
+        # DM Setup Wizard Handler
+        if message.author.id in user_setup_state:
+            await handle_dm_setup_step(message)
+            return  # Don't process further
+
+        # Cycle Event Scheduler
+        if message.author.id in user_cycle_states:
+            state = user_cycle_states[message.author.id]
+            guild_id = state["guild_id"]
+            cycle_name = state["cycle_name"]
+            
+            try:
+                msg = await message.channel.send(f"⏳ Processing time for **{cycle_name}**...")
+                
+                # Use Groq to parse the time
+                parsed = await parse_natural_language_groq(f"Set {cycle_name} to {message.content}")
+                user_tz = get_user_tz_str(message.author.id)
+                time_str = parsed.get("time_string", "")
+                if not time_str: raise ValueError("Could not determine a time.")
+                
+                end_epoch = parse_time_input(time_str, "smart", user_tz)
+                guild = bot.get_guild(guild_id)
+                
+                if not guild:
+                    await msg.edit(content="❌ Could not find your Server to schedule this.")
+                else:
+                    await add_timer_internal(
+                        guild, 
+                        parsed.get("label", cycle_name), 
+                        end_epoch, 
+                        None, 
+                        "📢 Message in Server (Ping Role)", 
+                        "smart", 
+                        0, 
+                        None, 
+                        900, 
+                        [], 
+                        owner_id=message.author.id
+                    )
+                    await msg.edit(content=f"✅ Automatically published **{cycle_name}** to the Server Dashboard!")
+                    
+                del user_cycle_states[message.author.id]
+                return
+            except ValueError as e:
+                await msg.edit(content=f"❌ {str(e)}\nTry replying again with the time.")
+                return
+            except Exception as e:
+                logger.error(f"Cycle NLP error: {e}")
+                await msg.edit(content="❌ An error occurred parsing that. Try replying again with the time.")
+                return
+        
+        # Foundry Handler
         if message.author.id in user_foundry_state:
             state = user_foundry_state[message.author.id]
             step = state["step"]
@@ -2192,7 +3132,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # Helper Wrapper for Add Timer (Internal Use)
-async def add_timer_internal(guild, label, end_epoch, role_id, notify, mode, recur, img, dur, rems):
+async def add_timer_internal(guild, label, end_epoch, role_id, notify, mode, recur, img, dur, rems, owner_id=None, description=None):
     # Mock Interaction for reusable logic? Hard to mock.
     # Better: access data directly.
     data = load_data()
@@ -2200,13 +3140,14 @@ async def add_timer_internal(guild, label, end_epoch, role_id, notify, mode, rec
     if gid not in data: return
     if "timers" not in data[gid]: data[gid]["timers"] = []
     
-    evt_id = await create_discord_event(guild, label, end_epoch, dur)
+    evt_id = await create_discord_event(guild, label, end_epoch, dur, description=description)
     
     nt = {
         "label": label, "end_epoch": end_epoch, "start_epoch": int(time.time()),
-        "owner_id": bot.user.id, "role_id": None, "notify_method": notify,
+        "owner_id": owner_id or bot.user.id, "role_id": role_id, "notify_method": notify,
         "mode": mode, "recurrence_seconds": recur, "discord_event_id": evt_id,
-        "event_duration": dur, "reminders": rems, "sent_reminders": []
+        "event_duration": dur, "reminders": rems, "sent_reminders": [],
+        "description": description
     }
     data[gid]["timers"].append(nt)
     data[gid]["timers"].sort(key=lambda x: x["end_epoch"])
@@ -2403,6 +3344,47 @@ async def check_timers():
         context_data["timers"] = active_timers
         if expired_timers and not data_changed: data_changed = True # Removal counts as change
 
+        # --- Cycle Checks ---
+        cycles = context_data.get("cycles", [])
+        for cycle in cycles:
+            mgr_ids = context_data.get("timing_managers", [])
+            if not mgr_ids: 
+                if guild: mgr_ids = [guild.owner_id]
+                else: continue
+            
+            # Step 1: Pre-Voting (24h before start_epoch)
+            pre_time = cycle['start_epoch'] - 86400
+            if current_time >= pre_time and not cycle.get('pre_dm_sent', False):
+                cycle['pre_dm_sent'] = True
+                data_changed = True
+                for mid in set(mgr_ids):
+                    try:
+                        m = await bot.fetch_user(mid)
+                        await m.send(f"🏆 **Reminder:** `{cycle['name']}` voting opens in 24 hours! Don't forget to post the poll.")
+                    except: pass
+            
+            # Step 2: Post-Voting (start_epoch + duration_sec)
+            post_time = cycle['start_epoch'] + cycle['duration_sec']
+            if current_time >= post_time and not cycle.get('post_dm_sent', False):
+                cycle['post_dm_sent'] = True
+                data_changed = True
+                
+                for mid in set(mgr_ids):
+                    try:
+                        m = await bot.fetch_user(mid)
+                        await m.send(f"🗳️ Voting has ended for `{cycle['name']}`!\n\n**What time are we running the event?**\n*(Reply here, e.g. \"Set {cycle['name']} for Thursday 14:00 UTC\")*")
+                        if guild: user_cycle_states[mid] = {"guild_id": guild.id, "cycle_name": cycle['name']}
+                    except: pass
+                    
+                # Move to next cycle
+                if cycle['interval_sec'] > 0:
+                    # Catch up if bot was offline
+                    while current_time >= (cycle['start_epoch'] + cycle['interval_sec']):
+                         cycle['start_epoch'] += cycle['interval_sec']
+                    cycle['start_epoch'] += cycle['interval_sec']
+                    cycle['pre_dm_sent'] = False
+                    cycle['post_dm_sent'] = False
+
     if data_changed:
         save_data(data)
         # Refresh Dashboards
@@ -2420,12 +3402,15 @@ async def before_check_timers():
 async def on_ready():
     logger.info(f"Chrono Cloudy v45 ONLINE as {bot.user}")
     
-    # Auto-Sync Global Commands (For DMs/User Install)
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"✅ Auto-Synced {len(synced)} Global Commands")
-    except Exception as e:
-        logger.error(f"❌ Auto-Sync Failed: {e}")
+    # Only sync if not already done recently or if needed
+    # (setup_hook already does this, but on_ready is a safety net)
+    if not hasattr(bot, 'commands_synced'):
+        try:
+            synced = await bot.tree.sync()
+            logger.info(f"✅ Auto-Synced {len(synced)} Global Commands")
+            bot.commands_synced = True
+        except Exception as e:
+            logger.error(f"❌ Auto-Sync Failed: {e}")
 
     bot.add_view(DashboardView())
     await check_missed_events()

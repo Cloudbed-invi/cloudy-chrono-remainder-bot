@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 timers.json
 discloud.config
+chrono_local.db
+db/
+log/
+implementation_plan.md
