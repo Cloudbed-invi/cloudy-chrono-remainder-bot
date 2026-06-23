@@ -41,12 +41,27 @@ async def start_health_server():
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import json
-import time
-import asyncio
+import os
+import sys
 import re
+import time
+import json
+import asyncio
+import aiohttp
+import traceback
+import platform
+import socket
 import logging
 from typing import Any
+
+# --- Single Instance Lock ---
+try:
+    single_instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    single_instance_socket.bind(("127.0.0.1", 47200))
+except socket.error:
+    print("Another instance of the bot is already running. Exiting.")
+    sys.exit(1)
+
 from datetime import datetime, timedelta, timezone
 import zoneinfo
 import groq
@@ -178,7 +193,6 @@ class StratusBot(commands.Bot):
         await start_health_server()
         
         # Register Persistent Views
-        self.add_view(DiceView())
         
         # Legacy cogs removed.
         
@@ -288,6 +302,11 @@ def parse_reminders_string(input_str: str) -> list:
 
 def parse_time_input(user_input: str, mode: str = "smart", user_tz_str: str = "UTC") -> int | tuple[str, str]:
     user_input = user_input.strip().lower()
+    
+    # Clean up timezone suffixes that NLP might incorrectly leave in the time string
+    user_input = re.sub(r'\s*\(?utc\)?$', '', user_input)
+    user_input = re.sub(r'\s*\(?gmt\)?$', '', user_input)
+    user_input = user_input.strip()
     
     try:
         user_tz = zoneinfo.ZoneInfo(user_tz_str) if user_tz_str.upper() != "UTC" else timezone.utc
@@ -1552,6 +1571,41 @@ class DashboardView(discord.ui.View):
         embed.add_field(name="⚙️ Management", value="Use **Manage Active** to Edit/Delete.", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+class RecurrenceSuggestionView(discord.ui.View):
+    def __init__(self, context_id: str, label: str, interval: int, interval_str: str, is_dm: bool):
+        super().__init__(timeout=None)
+        self.context_id = context_id
+        self.label = label
+        self.interval = interval
+        self.interval_str = interval_str
+        self.is_dm = is_dm
+        
+        btn = discord.ui.Button(label=f"Make it Recurring ({interval_str})", style=discord.ButtonStyle.success, custom_id=f"suggest_{label}_{interval}")
+        btn.callback = self.make_recurring
+        self.add_item(btn)
+        
+    async def make_recurring(self, interaction: discord.Interaction):
+        data = load_data()
+        if self.context_id in data and "timers" in data[self.context_id]:
+            for t in data[self.context_id]["timers"]:
+                if t['label'].lower() == self.label.lower():
+                    if not check_permissions(interaction, t['owner_id']):
+                        await interaction.response.send_message("❌ You can only modify your own timers.", ephemeral=True)
+                        return
+                    
+                    t["recurrence_seconds"] = self.interval
+                    save_data(data)
+                    if not self.is_dm and interaction.guild:
+                        await update_dashboard(interaction.guild, data[self.context_id], resend=True)
+                    
+                    await interaction.response.send_message(f"✅ Awesome! **{self.label}** is now a recurring event repeating every {self.interval_str}.", ephemeral=True)
+                    
+                    # Disable button
+                    for item in self.children: item.disabled = True
+                    await interaction.message.edit(view=self)
+                    return
+        await interaction.response.send_message("❌ Timer not found. It may have already expired.", ephemeral=True)
+
 # --- Core Logic ---
 async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int, role_id: int, notify_method: str, mode: str, recurrence_seconds: int = 0, image_url: str = None, event_duration: int = 900, reminders: list = None, description: str = None):
     # Context ID (Guild OR User)
@@ -1562,9 +1616,9 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
     if context_id not in data: data[context_id] = {"timers": []}
     if "timers" not in data[context_id]: data[context_id]["timers"] = []
     
-    # Create Discord Event (Only if Guild)
+    # Create Discord Event (Only if Guild and has a role ping)
     discord_event_id = None
-    if not is_dm and mode != "silent":
+    if not is_dm and mode != "silent" and role_id:
          discord_event_id = await create_discord_event(interaction.guild, label, end_epoch, event_duration, description=description)
     
     # Save Timer
@@ -1587,12 +1641,33 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
     
     data[context_id]["timers"].append(new_timer)
     data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
-    save_data(data)
     
-    # Update Dashboard (Removed from here, moved to end)
-    # try:
-    #      if not is_dm: await update_dashboard(interaction.guild, data[context_id])
-    # except: pass
+    # Task 5 & 6: History Tracking & Recurrence Detection
+    suggest_view = None
+    if recurrence_seconds == 0:
+        hist = data[context_id].setdefault("history", {})
+        lbl_key = label.lower()
+        
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(end_epoch, timezone.utc)
+        time_str = dt.strftime("%H:%M")
+        
+        history_list = hist.get(lbl_key, [])
+        history_list.append({"epoch": end_epoch, "time_str": time_str})
+        history_list = history_list[-5:]
+        hist[lbl_key] = history_list
+        
+        if len(history_list) >= 3:
+            last_3 = history_list[-3:]
+            if last_3[0]["time_str"] == last_3[1]["time_str"] == last_3[2]["time_str"]:
+                diff1 = last_3[1]["epoch"] - last_3[0]["epoch"]
+                diff2 = last_3[2]["epoch"] - last_3[1]["epoch"]
+                
+                # Check if strictly positive, matching, and a multiple of a day (or exact)
+                if diff1 > 0 and diff1 == diff2 and (diff1 % 86400 == 0):
+                    suggest_view = RecurrenceSuggestionView(context_id, label, diff1, get_interval_str(diff1), is_dm)
+
+    save_data(data)
     
     # Confirmation Embed
     ts = int(end_epoch)
@@ -1611,7 +1686,10 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
     embed.description = desc
     if image_url: embed.set_image(url=image_url)
     
-    await interaction.followup.send(embed=embed)
+    if suggest_view:
+        await interaction.followup.send(embed=embed, view=suggest_view)
+    else:
+        await interaction.followup.send(embed=embed)
     
     # Update Dashboard (Resend to bottom)
     try: 
@@ -1620,24 +1698,71 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
 
 
 async def update_dashboard(guild_or_user, data, resend: bool = False):
-    """Updates the dashboard message."""
+    """Updates all dashboard messages."""
     if not data: return
     
-    # Context Handling
-    db_channel_id = data.get("dashboard_channel_id")
-    db_msg_id = data.get("dashboard_message_id")
+    # 1. Migration block to ensure dashboards array exists
+    if "dashboards" not in data:
+        data["dashboards"] = []
+        if data.get("dashboard_channel_id") and data.get("dashboard_message_id"):
+            data["dashboards"].append({
+                "name": "Main Dashboard",
+                "channel_id": data["dashboard_channel_id"],
+                "message_id": data["dashboard_message_id"]
+            })
+            
+    if not data["dashboards"]: return
     
-    if not db_channel_id or not db_msg_id: return
-    
-    try:
-        if isinstance(guild_or_user, discord.Guild):
-             channel = guild_or_user.get_channel(db_channel_id)
-        else:
-             # DM Context - we likely can't fetch channel by ID easily unless we keep the DM channel object
-             # For now, skip auto-updating dashboard in DMs unless we have a reliable way to get the channel
-             return 
+    if not isinstance(guild_or_user, discord.Guild):
+        return # Skip DM dashboards for now
 
-        if not channel: return
+    valid_dashboards = []
+    dashboards_modified = False
+    
+    # Pre-compute embed description since it's the same for all dashboards
+    description = ""
+    if not data.get("timers"):
+        description = "*☁️ Chrono Silent - No Active Operations*"
+    else:
+        for timer in data["timers"]:
+            ts = timer.get('override_epoch', timer['end_epoch'])
+            icon = "📢" 
+            notify = timer.get("notify_method", "")
+            if "DM" in notify and "Server" not in notify: icon = "📩"
+            if "Silent" in notify: icon = "🔕"
+            repeat_icon = "🔄 " if timer.get("recurrence_seconds", 0) > 0 else ""
+            override_text = " *(One-Off Override)*" if "override_epoch" in timer else ""
+            
+            owner = f"<@{timer['owner_id']}>"
+            role_tag = ""
+            if timer.get("role_id"):
+                role_tag = f" <@&{timer['role_id']}>"
+            
+            if timer.get("type") == "foundry_job":
+                 icon = "🔥"
+                 description += f"> **{timer['label']}**\n> 🤖 Check: <t:{ts}:f> (<t:{ts}:R>)\n\n"
+            else:
+                 details = ""
+                 if timer.get("description"):
+                     details = f"\n> 📝 *{timer['description']}*"
+                     
+                 description += f"> **{timer['label']}** (by {owner}){role_tag} {icon} {repeat_icon}{override_text}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>){details}\n\n"
+
+    for dashboard in data["dashboards"]:
+        db_channel_id = dashboard.get("channel_id")
+        db_msg_id = dashboard.get("message_id")
+        db_name = dashboard.get("name", "Main Dashboard")
+        
+        channel = guild_or_user.get_channel(db_channel_id)
+        if not channel:
+            dashboards_modified = True
+            continue # Remove orphaned dashboard
+            
+        embed = discord.Embed(title=f"☁️ Chrono Dashboard - {db_name}", color=discord.Color.from_rgb(47, 49, 54))
+        embed.description = description
+        embed.set_image(url=DUMMY_SPACER)
+        embed.set_footer(text="Chrono Cloudy | Time is of the Essence ☁️")
+        view = DashboardView()
 
         if resend:
             try:
@@ -1646,52 +1771,17 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                         try: await p.unpin(); await p.delete()
                         except: pass
             except: pass
-
-        embed = discord.Embed(title="☁️ Chrono Dashboard", color=discord.Color.from_rgb(47, 49, 54))
-        description = ""
-        
-        if not data.get("timers"):
-            description = "*☁️ Chrono Silent - No Active Operations*"
-        else:
-            for timer in data["timers"]:
-                ts = timer['end_epoch']
-                icon = "📢" 
-                notify = timer.get("notify_method", "")
-                if "DM" in notify and "Server" not in notify: icon = "📩"
-                if "Silent" in notify: icon = "🔕"
-                repeat_icon = "🔄 " if timer.get("recurrence_seconds", 0) > 0 else ""
-                
-                owner = f"<@{timer['owner_id']}>"
-                role_tag = ""
-                if timer.get("role_id"):
-                    role_tag = f" <@&{timer['role_id']}>"
-                
-                if timer.get("type") == "foundry_job":
-                     icon = "🔥"
-                     description += f"> **{timer['label']}**\n> 🤖 Check: <t:{ts}:f> (<t:{ts}:R>)\n\n"
-                else:
-                     details = ""
-                     if timer.get("description"):
-                         details = f"\n> 📝 *{timer['description']}*"
-                         
-                     description += f"> **{timer['label']}** (by {owner}){role_tag} {icon} {repeat_icon}\n> ⏱️ <t:{ts}:f> (<t:{ts}:R>){details}\n\n"
-        
-        embed.description = description
-        embed.set_image(url=DUMMY_SPACER)
-        embed.set_footer(text="Chrono Cloudy | Time is of the Essence ☁️")
-        
-        view = DashboardView()
-
-        if resend:
+            
             try:
                 old_msg = await channel.fetch_message(db_msg_id)
                 await old_msg.delete()
             except: pass
+            
             try:
                 new_msg = await channel.send(embed=embed, view=view)
                 try: await new_msg.pin()
                 except: pass
-                # Clean up "Pinned a message" notification
+                # Clean up pin msg
                 try:
                     async for sys_msg in channel.history(limit=5):
                         if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == new_msg.id:
@@ -1699,34 +1789,39 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
                             break
                 except: pass
                 
-                data["dashboard_message_id"] = new_msg.id
-                # Correctly save the data
-                all_data = load_data()
-                if isinstance(guild_or_user, discord.Guild):
-                    # CRITICAL FIX: Update the DB object with our CURRENT fresh data (including new timers)
-                    # before saving. Otherwise, loading stale data overwrites our new timers.
-                    all_data[str(guild_or_user.id)] = data 
-                    all_data[str(guild_or_user.id)]["dashboard_message_id"] = new_msg.id
-                    all_data[str(guild_or_user.id)]["dashboard_channel_id"] = channel.id
-                    save_data(all_data)
-            except: pass
+                dashboard["message_id"] = new_msg.id
+                dashboards_modified = True
+                valid_dashboards.append(dashboard)
+            except: 
+                dashboards_modified = True # failed to resend, drop it
         else:
             try:
                 message = await channel.fetch_message(db_msg_id)
                 await message.edit(embed=embed, view=view)
             except: pass
-    except Exception as e:
-        logger.error(f"Dashboard Update Error: {e}")
+
 
 # --- Setup Logic ---
 async def run_setup(guild, channel):
     data = load_data()
     guild_id = str(guild.id)
-    if guild_id in data and "dashboard_message_id" in data[guild_id]:
+    if guild_id not in data: data[guild_id] = {}
+    
+    dashboards = data[guild_id].get("dashboards", [])
+    if not dashboards and "dashboard_message_id" in data[guild_id]:
+        dashboards = [{
+            "name": "Main Dashboard",
+            "channel_id": data[guild_id]["dashboard_channel_id"],
+            "message_id": data[guild_id]["dashboard_message_id"]
+        }]
+        data[guild_id]["dashboards"] = dashboards
+        
+    main_db = next((d for d in dashboards if d["name"] == "Main Dashboard"), None)
+    if main_db:
         try:
-            old_chan = guild.get_channel(data[guild_id].get("dashboard_channel_id"))
+            old_chan = guild.get_channel(main_db["channel_id"])
             if old_chan:
-                old_msg = await old_chan.fetch_message(data[guild_id]["dashboard_message_id"])
+                old_msg = await old_chan.fetch_message(main_db["message_id"])
                 return f"EXISTING:{old_msg.jump_url}"
         except: pass
 
@@ -1744,11 +1839,20 @@ async def run_setup(guild, channel):
                  break
     except: pass
 
-    data[guild_id] = {
-        "dashboard_channel_id": channel.id,
-        "dashboard_message_id": message.id,
-        "timers": []
-    }
+    if "timers" not in data[guild_id]: data[guild_id]["timers"] = []
+    if "dashboards" not in data[guild_id]: data[guild_id]["dashboards"] = []
+    
+    existing = next((d for d in data[guild_id]["dashboards"] if d["name"] == "Main Dashboard"), None)
+    if existing:
+        existing["channel_id"] = channel.id
+        existing["message_id"] = message.id
+    else:
+        data[guild_id]["dashboards"].append({
+            "name": "Main Dashboard",
+            "channel_id": channel.id,
+            "message_id": message.id
+        })
+        
     save_data(data)
     await update_dashboard(guild, data[guild_id])
     return message.jump_url
@@ -1763,7 +1867,7 @@ async def refresh(ctx):
     guild_id = str(ctx.guild.id)
     
     await ctx.send("🔄 **Refreshing Dashboard...**")
-    if guild_id not in data or "dashboard_message_id" not in data[guild_id]:
+    if guild_id not in data or ("dashboards" not in data[guild_id] and "dashboard_message_id" not in data[guild_id]):
         # Auto-setup if missing
         await run_setup(ctx.guild, ctx.channel)
         await ctx.send("✅ Dashboard initialized.")
@@ -1780,7 +1884,7 @@ async def refresh_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     data = load_data()
     guild_id = str(interaction.guild_id)
-    if guild_id in data and "dashboard_message_id" in data[guild_id]:
+    if guild_id in data and ("dashboards" in data[guild_id] or "dashboard_message_id" in data[guild_id]):
         await update_dashboard(interaction.guild, data[guild_id], resend=True)
         await interaction.followup.send("✅ **Dashboard Refreshed & Pinned!**", ephemeral=True)
     else:
@@ -1816,7 +1920,7 @@ async def parse_natural_language_groq(text: str) -> dict:
     User Request: "{text}"
     
     CRITICAL INSTRUCTIONS:
-    1. Action: Determine if the user wants to "create" a timer, "edit" an existing one, "delete" (cancel/remove) one, "add_manager", "remove_manager", or "set_cycle".
+    1. Action: Determine if the user wants to "create" a timer, "edit" an existing one, "override" a specific occurrence of a recurring event, "delete" (cancel/remove) one, "add_manager", "remove_manager", or "set_cycle".
     2. Languages: You must perfectly understand requests in ANY language (Spanish, French, Arabic, etc.), but ALWAYS translate the event name (Label) into standard English.
     3. Custom Events: If they specify a custom event name not listed below, use exactly what they typed (translated to English).
     4. Roles: If they mention pinging/tagging a specific role (like "@North America", "ping R4", "tag the alliance"), extract that role's name WITHOUT the '@'.
@@ -1834,30 +1938,38 @@ async def parse_natural_language_groq(text: str) -> dict:
     
     Respond ONLY with a valid JSON object matching this structure (no markdown tags):
     {{
-      "action": "create", // or "edit", "delete", "add_manager", "remove_manager", "set_cycle"
-      "label": "The name of the event (use standard game emojis if matching defaults, otherwise use their exact string in English).",
-      "time_string": "The extracted time string (e.g., '10m', '1h', '14:00'). For 'delete' actions, leave empty.",
+      "action": "create", // or "edit", "override", "delete", "add_manager", "remove_manager", "set_cycle"
+      "label": "The name of the event (use standard game emojis if matching defaults, but ALWAYS preserve any extra numbers/words the user added, e.g., 'Bear Trap 2' -> '🐻 Bear Trap 2'). If the user does not specify a title, intelligently infer an appropriate one (e.g. 'General Reminder').",
+      "description": "A brief description of the event. Extract extra context from the user's prompt if provided. If not provided, intelligently generate a short, fun, and appropriate description for the event.",
+      "time_string": "The extracted time. You MUST convert all natural/foreign times (e.g. 'halb drei', '3 PM') into strict 24-hour formats ('14:30', '15:00', 'YYYY-MM-DD HH:MM') or durations ('2h 30m'). DO NOT include timezone names.",
+      "timezone": "The explicitly stated timezone (e.g., 'EST', 'CET'). Leave empty if none is mentioned.",
       "duration_string": "Only used for set_cycle (e.g. '24h', '48h'). Empty otherwise.",
       "interval_string": "The extracted repeat interval (e.g., '24h'). Use '0' if it doesn't repeat.",
       "reminders_string": "Any early reminders mentioned (e.g., '10m, 5m').",
       "target_role": "The name of the role they want to ping, or the name of the user to add to managers. Leave empty if not specified.",
-      "notify_method": "channel" // or "dm" or "both"
+      "notify_method": "channel" // or "dm" or "both". VERY IMPORTANT: If action is "edit", leave this empty unless the user explicitly asks to change the notification method!
     }}
     
+    CRITICAL: For "edit" actions, you MUST leave any field empty/blank ("") if the user does NOT explicitly ask to change it. For example, if they only say "tag me", leave time_string="", description="", etc.
+
+    
     Example 1: "Remind me everyother day about beartrap at 14:00 UTC and tag role @North America"
-    Output: {{"action": "create", "label": "🐻 Bear Trap", "time_string": "14:00 UTC", "duration_string": "", "interval_string": "48h", "reminders_string": "30m, 5m", "target_role": "North America", "notify_method": "channel"}}
+    Output: {{"action": "create", "label": "🐻 Bear Trap", "description": "Prepare for the Bear Trap event! Ensure your troops are ready.", "time_string": "14:00", "timezone": "UTC", "duration_string": "", "interval_string": "48h", "reminders_string": "30m, 5m", "target_role": "North America", "notify_method": "channel"}}
     
     Example 2: "PM all and mention role R4 for Castle in 2h"
-    Output: {{"action": "create", "label": "🏰 Castle Battle", "time_string": "2h", "duration_string": "", "interval_string": "28d", "reminders_string": "5h, 1h", "target_role": "R4", "notify_method": "both"}}
+    Output: {{"action": "create", "label": "🏰 Castle Battle", "description": "The battle for the Castle begins soon! Assemble your forces.", "time_string": "2h", "timezone": "", "duration_string": "", "interval_string": "28d", "reminders_string": "5h, 1h", "target_role": "R4", "notify_method": "both"}}
     
     Example 3: "Elimina mi recordatorio de trampa de osos"
-    Output: {{"action": "delete", "label": "🐻 Bear Trap", "time_string": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+    Output: {{"action": "delete", "label": "🐻 Bear Trap", "description": "", "time_string": "", "timezone": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
 
     Example 4: "Add @John to the timing managers"
-    Output: {{"action": "add_manager", "label": "", "time_string": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "John", "notify_method": "channel"}}
+    Output: {{"action": "add_manager", "label": "", "description": "", "time_string": "", "timezone": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "John", "notify_method": "channel"}}
 
     Example 5: "I have foundry on this friday voting starts on tuesday and ends on wednesday. repeats every 2 weeks."
-    Output: {{"action": "set_cycle", "label": "Foundry", "time_string": "Tuesday", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+    Output: {{"action": "set_cycle", "label": "Foundry", "description": "Foundry event cycle.", "time_string": "Tuesday", "timezone": "", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+
+    Example 6: "Upcoming Bear Trap will be tomorrow 18:00 UTC but rest normal"
+    Output: {{"action": "override", "label": "🐻 Bear Trap", "description": "", "time_string": "tomorrow 18:00", "timezone": "UTC", "duration_string": "", "interval_string": "", "reminders_string": "", "target_role": "", "notify_method": ""}}
     """
     
     try:
@@ -1937,6 +2049,8 @@ async def remind_slash(interaction: discord.Interaction, request: str):
                 return
                 
             user_tz = get_user_tz_str(interaction.user.id)
+            if parsed.get("timezone"):
+                user_tz = parsed.get("timezone")
             time_str = parsed.get("time_string", "")
             duration_str = parsed.get("duration_string", "24h")
             interval_str = parsed.get("interval_string", "14d")
@@ -2001,57 +2115,39 @@ async def remind_slash(interaction: discord.Interaction, request: str):
 
         # Time Parsing for Create/Edit
         user_tz = get_user_tz_str(interaction.user.id)
+        if parsed.get("timezone"):
+            user_tz = parsed.get("timezone")
         time_str = parsed.get("time_string", "")
-        if not time_str: raise ValueError("Could not determine a time.")
-        end_epoch = parse_time_input(time_str, "smart", user_tz)
+        end_epoch = None
+        if time_str:
+            end_epoch = parse_time_input(time_str, "smart", user_tz)
+        elif action == "create":
+            raise ValueError("Could not determine a time.")
         
-        recurrence_seconds = 0
+        recurrence_seconds = None
         interval_str = parsed.get("interval_string", "0")
         if interval_str and str(interval_str) != "0":
             try: recurrence_seconds = parse_duration_string(str(interval_str))
             except: pass
             
-        reminders_list = []
+        reminders_list = None
         reminders_str = parsed.get("reminders_string")
         if reminders_str:
             reminders_list = parse_reminders_string(str(reminders_str))
             
-        # 2. EDIT ACTION
-        if action == "edit":
-            data = load_data()
-            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
-            if context_id in data and "timers" in data[context_id]:
-                for t in data[context_id]["timers"]:
-                    if t['label'].lower() == label.lower():
-                        if not check_permissions(interaction, t['owner_id']):
-                            await interaction.followup.send("❌ **Access Denied.** You can only edit your own timers.", ephemeral=True); return
-                        
-                        t["end_epoch"] = end_epoch
-                        t["start_epoch"] = int(time.time())
-                        t["sent_reminders"] = []
-                        if recurrence_seconds: t["recurrence_seconds"] = recurrence_seconds
-                        if reminders_list: t["reminders"] = reminders_list
-                        
-                        if t.get("discord_event_id") and interaction.guild:
-                             await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t["end_epoch"], t.get("event_duration", 900))
-                        
-                        data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
-                        save_data(data)
-                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
-                        await interaction.followup.send(f"✅ Updated timer **{label}** to new time.", ephemeral=True)
-                        return
-            await interaction.followup.send(f"❌ Timer **{label}** not found to edit.", ephemeral=True)
-            return
-
-        # 3. CREATE ACTION
-        # Role & Permissions Logic
+        # Role & Notification Extraction
         target_role_str = parsed.get("target_role", "")
         role_id = None
-        notify_str = parsed.get("notify_method", "channel")
+        notify_str = parsed.get("notify_method", "")
+        notify_method = None
         
         if notify_str == "both": notify_method = "📣 Both (Ping & DM)"
         elif notify_str == "dm": notify_method = "📩 DM Me"
-        else: notify_method = "📢 Message in Server (Ping Role)"
+        elif notify_str == "channel": notify_method = "📢 Message in Server (Ping Role)"
+        
+        # If create, default to channel
+        if action == "create" and not notify_method:
+            notify_method = "📢 Message in Server (Ping Role)"
         
         if not interaction.guild:
             notify_method = "📩 DM Me"
@@ -2065,8 +2161,81 @@ async def remind_slash(interaction: discord.Interaction, request: str):
                     else:
                         await interaction.followup.send(f"⚠️ You lack permissions to ping the **{r.name}** role. Reverting to channel alert without ping.", ephemeral=True)
                     break
+            # If no role matched and target_role_str is set, maybe they meant DM?
+            if not role_id and "me" in target_role_str.lower():
+                notify_method = "📩 DM Me"
+        
+        description = parsed.get("description", "")
             
-        await add_timer(interaction, label, end_epoch, role_id, notify_method, "smart", recurrence_seconds, None, 900, reminders_list)
+        # 2. EDIT ACTION
+        if action == "edit":
+            data = load_data()
+            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+            if context_id in data and "timers" in data[context_id]:
+                for t in data[context_id]["timers"]:
+                    if t['label'].lower() == label.lower():
+                        if not check_permissions(interaction, t['owner_id']):
+                            await interaction.followup.send("❌ **Access Denied.** You can only edit your own timers.", ephemeral=True); return
+                        
+                        if end_epoch:
+                            t["end_epoch"] = end_epoch
+                            t["start_epoch"] = int(time.time())
+                            t["sent_reminders"] = []
+                        if recurrence_seconds is not None: t["recurrence_seconds"] = recurrence_seconds
+                        if reminders_list is not None: t["reminders"] = reminders_list
+                        if notify_method: t["notify_method"] = notify_method
+                        if target_role_str: 
+                            t["role_id"] = role_id
+                            if not role_id and "me" in target_role_str.lower(): t["role_id"] = None
+                        if description: t["description"] = description
+                        
+                        if not t.get("role_id") and t.get("discord_event_id") and interaction.guild:
+                            try: await delete_discord_event(interaction.guild, t["discord_event_id"])
+                            except: pass
+                            t["discord_event_id"] = None
+                        elif t.get("discord_event_id") and interaction.guild:
+                             await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t.get("end_epoch", end_epoch), t.get("event_duration", 900))
+                        
+                        data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
+                        save_data(data)
+                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
+                        await interaction.followup.send(f"✅ Updated timer **{label}**.", ephemeral=True)
+                        return
+            await interaction.followup.send(f"❌ Timer **{label}** not found to edit.", ephemeral=True)
+            return
+
+        # 2.5 OVERRIDE ACTION
+        if action == "override":
+            data = load_data()
+            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+            if context_id in data and "timers" in data[context_id]:
+                for t in data[context_id]["timers"]:
+                    if t['label'].lower() == label.lower():
+                        if not check_permissions(interaction, t['owner_id']):
+                            await interaction.followup.send("❌ **Access Denied.** You can only override your own timers.", ephemeral=True); return
+                        
+                        if not end_epoch:
+                            await interaction.followup.send("❌ You must specify the new overridden time.", ephemeral=True); return
+                            
+                        if not t.get("recurrence_seconds"):
+                            await interaction.followup.send("❌ Overrides are only for recurring events. For normal events, use edit.", ephemeral=True); return
+
+                        t["override_epoch"] = end_epoch
+                        t["sent_reminders"] = []
+                        
+                        # Update native discord event to reflect the override
+                        if t.get("discord_event_id") and interaction.guild:
+                             await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], end_epoch, t.get("event_duration", 900))
+                        
+                        # Note: we don't re-sort by end_epoch since the base end_epoch hasn't changed.
+                        save_data(data)
+                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
+                        await interaction.followup.send(f"✅ Set one-off override for **{label}** to <t:{end_epoch}:f>.", ephemeral=True)
+                        return
+            await interaction.followup.send(f"❌ Recurring timer **{label}** not found.", ephemeral=True)
+            return
+
+        await add_timer(interaction, label, end_epoch, role_id, notify_method or "📢 Message in Server (Ping Role)", "smart", recurrence_seconds or 0, None, 900, reminders_list or [], description)
         
     except ValueError as e:
         await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
@@ -2074,10 +2243,11 @@ async def remind_slash(interaction: discord.Interaction, request: str):
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="dashboard", description="Create or Move the Chrono Dashboard")
+@bot.tree.command(name="dashboard", description="Create or Move a Chrono Dashboard")
+@app_commands.describe(name="The name of the dashboard (defaults to 'Main Dashboard')")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def dashboard(interaction: discord.Interaction):
+async def dashboard(interaction: discord.Interaction, name: str = "Main Dashboard"):
     if interaction.guild is None:
         await interaction.response.send_message("❌ The live dashboard is not supported in DMs. Please use `/mytimers` instead to view your personal timers.", ephemeral=True)
         return
@@ -2091,7 +2261,17 @@ async def dashboard(interaction: discord.Interaction):
     data = load_data()
     if context_id not in data: data[context_id] = {}
     
-    embed = discord.Embed(title="☁️ Chrono Dashboard", color=discord.Color.from_rgb(47, 49, 54))
+    # Migration block
+    if "dashboards" not in data[context_id]:
+        data[context_id]["dashboards"] = []
+        if "dashboard_channel_id" in data[context_id]:
+            data[context_id]["dashboards"].append({
+                "name": "Main Dashboard",
+                "channel_id": data[context_id]["dashboard_channel_id"],
+                "message_id": data[context_id]["dashboard_message_id"]
+            })
+    
+    embed = discord.Embed(title=f"☁️ Chrono Dashboard - {name}", color=discord.Color.from_rgb(47, 49, 54))
     embed.description = "*☁️ Chrono Silent - No Active Operations*"
     
     # Send new dashboard
@@ -2110,12 +2290,21 @@ async def dashboard(interaction: discord.Interaction):
     except: pass
     
     # Save Location
-    data[context_id]["dashboard_channel_id"] = interaction.channel_id
-    data[context_id]["dashboard_message_id"] = msg.id
+    existing = next((d for d in data[context_id]["dashboards"] if d["name"].lower() == name.lower()), None)
+    if existing:
+        existing["channel_id"] = interaction.channel_id
+        existing["message_id"] = msg.id
+    else:
+        data[context_id]["dashboards"].append({
+            "name": name,
+            "channel_id": interaction.channel_id,
+            "message_id": msg.id
+        })
+        
     save_data(data)
     
-    # Force Update (if guild)
-    if not is_dm: await update_dashboard(interaction.guild, data[context_id], resend=True)
+    # Refresh to fill timers
+    await update_dashboard(interaction.guild, data[context_id], resend=False)
 
 @bot.tree.command(name="mytimers", description="View your active personal timers in DMs")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -2258,8 +2447,12 @@ async def check_missed_events():
         
         # Resolve Context
         guild = None
-        try: guild = bot.get_guild(int(context_id_str))
+        user = None
+        try: guild = bot.get_guild(int(context_id_str)) or await bot.fetch_guild(int(context_id_str))
         except: pass
+        if not guild:
+            try: user = await bot.fetch_user(int(context_id_str))
+            except: pass
         
         # Re-check timers for missed reminders (even if not expired)
         for timer in context_data["timers"]:
@@ -2276,25 +2469,28 @@ async def check_missed_events():
                         msg = f"⚠️ **Late Reminder (Bot Restarted):** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
                         try:
                             if guild:
-                                chan = guild.get_channel(context_data.get("dashboard_channel_id"))
+                                chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
                                 if chan: await chan.send(msg)
-                            # DMs handled if user object available (complex here, skip for robustness/speed)
+                            elif user:
+                                await user.send(msg)
                         except: pass
                         sent.append(r_sec)
                         timer["sent_reminders"] = sent
                         data_changed = True
+                
+                # BUGFIX: Must always keep active timers!
+                timers_to_keep.append(timer)
 
             elif timer["end_epoch"] <= now:
                 logger.info(f"Restoring expired timer: {timer['label']}")
                 try:
-                    # Notify logic? Missed event logic usually only server based.
-                    # For now keep it server only for simplicity/safey.
+                    embed = discord.Embed(title="⚠️ Missed Alert (Offline)", description=f"**{timer['label']}** ended at <t:{timer['end_epoch']}:t>.", color=discord.Color.orange())
                     if guild:
-                        chan = guild.get_channel(context_data.get("dashboard_channel_id"))
+                        chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
                         if chan:
-                            embed = discord.Embed(title="⚠️ Missed Alert (Offline)", description=f"**{timer['label']}** ended at <t:{timer['end_epoch']}:t>.", color=discord.Color.orange())
-                            # if bot.user.avatar: embed.set_thumbnail(url=bot.user.avatar.url)
                             await chan.send(content=f"<@{timer['owner_id']}>", embed=embed)
+                    elif user:
+                        await user.send(embed=embed)
                 except: pass
                 
                 recur = timer.get("recurrence_seconds", 0)
@@ -2322,8 +2518,6 @@ async def check_missed_events():
                     data_changed = True
                 else:
                     data_changed = True
-            else:
-                timers_to_keep.append(timer)
         
         # Check Foundry Missed
         # If it's Thursday/Friday/Saturday/Sunday and we haven't asked yet?
@@ -2345,182 +2539,6 @@ async def check_missed_events():
             save_data(data)
             if guild: await update_dashboard(guild, context_data)
 
-dice_pity_counters = {}
-
-class DiceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        
-    @discord.ui.button(label="Roll Again", style=discord.ButtonStyle.primary, custom_id="dice_roll_again_btn", emoji="🎲")
-    async def roll_again(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await execute_dice(interaction)
-
-async def execute_dice(interaction: discord.Interaction):
-    import random
-    import os
-    import asyncio
-    
-    user_id = interaction.user.id
-    pity = dice_pity_counters.get(user_id, 0)
-    
-    # Dynamic weighting for Pity System (Target: Land a 6)
-    # Extremely subtle pity: adds a tiny fraction to the weight of rolling a 6.
-    # Base weight is 10.0 per face. A bonus of 0.0001 per miss is practically invisible.
-    pity_bonus = pity * 0.0001
-    weights = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0 + pity_bonus]
-    roll = random.choices([1, 2, 3, 4, 5, 6], weights=weights, k=1)[0]
-    
-    # Reset pity on a 6, otherwise increment
-    if roll == 6:
-        dice_pity_counters[user_id] = 0
-    else:
-        dice_pity_counters[user_id] = pity + 1
-    
-    file_path = f"assets/dice_{roll}.png"
-    rolling_path = "assets/rolling.gif"
-    
-    if os.path.exists(file_path) and os.path.exists(rolling_path):
-        # 1. Send the generic looping rolling GIF first
-        embed_rolling = discord.Embed(title="🎲 Dice Roll", description="Rolling...", color=discord.Color.dark_gray())
-        file_roll = discord.File(rolling_path, filename="rolling.gif")
-        embed_rolling.set_thumbnail(url="attachment://rolling.gif")
-        
-        # Determine if responding to a slash command or a button
-        if interaction.type == discord.InteractionType.application_command:
-            await interaction.response.defer(thinking=True)
-            msg_interaction = await interaction.followup.send(embed=embed_rolling, file=file_roll, wait=True)
-        else:
-            # We are responding to a button click
-            await interaction.response.edit_message(view=None)
-            content_str = f"{interaction.user.mention} rolled!"
-            try:
-                msg_interaction = await interaction.channel.send(
-                    content=content_str, 
-                    embed=embed_rolling, 
-                    file=file_roll
-                )
-            except discord.Forbidden:
-                file_roll = discord.File(rolling_path, filename="rolling.gif")
-                msg_interaction = await interaction.followup.send(
-                    content=content_str, 
-                    embed=embed_rolling, 
-                    file=file_roll,
-                    wait=True
-                )
-        
-        # 2. Wait for the roll animation
-        await asyncio.sleep(1.8)
-        
-        # 3. Edit the message: Swap the GIF out for a STATIC PNG result.
-        embed_result = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
-        file_result = discord.File(file_path, filename="dice.png")
-        embed_result.set_thumbnail(url="attachment://dice.png")
-        
-        view = DiceView()
-        
-        try:
-            if interaction.type == discord.InteractionType.application_command:
-                await interaction.edit_original_response(
-                    embed=embed_result, 
-                    attachments=[file_result],
-                    view=view
-                )
-            else:
-                await msg_interaction.edit(
-                    embed=embed_result, 
-                    attachments=[file_result],
-                    view=view
-                )
-        except discord.NotFound:
-            pass
-            
-    else:
-        # Fallback if images missing
-        if not interaction.response.is_done():
-            embed = discord.Embed(title="🎲 Dice Roll", description=f"You rolled a **{roll}**!", color=discord.Color.blue())
-            await interaction.response.send_message(embed=embed)
-
-# @bot.tree.command(name="dice", description="Roll a 6-sided dice")
-# @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-# @app_commands.allowed_installs(guilds=True, users=True)
-async def dice_slash(interaction: discord.Interaction):
-    await execute_dice(interaction)
-
-active_targeted_rps: dict[str, Any] = {}
-
-class RPSChallengeView(discord.ui.View):
-    def __init__(self, match_id: str):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-        
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="rps_accept", emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = active_targeted_rps.get(self.match_id)
-        if not match:
-            await interaction.response.send_message("This challenge has expired!", ephemeral=True)
-            return
-        if interaction.user.id != match['target_id']:
-            await interaction.response.send_message("You are not the target of this challenge!", ephemeral=True)
-            return
-            
-        match['status'] = 'playing'
-        if match['mode'] == 'Random':
-            await interaction.response.defer()
-            await resolve_rps_match(interaction.message, self.match_id, None, None)
-        else:
-            view = RPSPlayView(self.match_id)
-            embed = discord.Embed(title="RPS Challenge Accepted!", description=f"<@{match['challenger_id']}> vs <@{match['target_id']}>\n\nBoth players, lock in your choices below!", color=discord.Color.green())
-            await interaction.response.edit_message(content=None, embed=embed, view=view)
-
-class RPSPlayView(discord.ui.View):
-    def __init__(self, match_id: str):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-        
-    async def handle_lock(self, interaction: discord.Interaction, choice: str):
-        match = active_targeted_rps.get(self.match_id)
-        if not match:
-            await interaction.response.send_message("This match has expired!", ephemeral=True)
-            return
-            
-        uid = interaction.user.id
-        if uid not in (match['challenger_id'], match['target_id']):
-            await interaction.response.send_message("You are not in this match!", ephemeral=True)
-            return
-            
-        if uid in match['choices']:
-            await interaction.response.send_message("You already locked in!", ephemeral=True)
-            return
-            
-        match['choices'][uid] = choice
-        await interaction.response.send_message(f"You securely locked in **{choice.title()}**! 🤫", ephemeral=True)
-        
-        if len(match['choices']) == 2:
-            try: await interaction.message.edit(view=None)
-            except: pass
-            
-            # If playing Bot, auto-generate bot choice
-            p2_choice = match['choices'].get(match['target_id'])
-            if match['target_id'] == interaction.client.user.id:
-                import random
-                p2_choice = random.choice(["rock", "paper", "scissors"])
-                
-            await resolve_rps_match(interaction.message, self.match_id, match['choices'][match['challenger_id']], p2_choice)
-
-    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, custom_id="rps_btn_rock", emoji="🪨")
-    async def lock_rock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "rock")
-        
-    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, custom_id="rps_btn_paper", emoji="📄")
-    async def lock_paper(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "paper")
-        
-    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, custom_id="rps_btn_scissors", emoji="✂️")
-    async def lock_scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "scissors")
-
-async def resolve_rps_match(msg: discord.Message, match_id: str, p1_choice: str = None, p2_choice: str = None):
-    import random
     import os
     import asyncio
     import time
@@ -2684,223 +2702,6 @@ async def rps_slash(interaction: discord.Interaction, target: discord.Member = N
 
 
 
-
-active_brawls: dict[str, Any] = {}
-
-class BrawlJoinView(discord.ui.View):
-    def __init__(self, message_id: str):
-        super().__init__(timeout=None)
-        self.message_id = message_id
-        
-    @discord.ui.button(label="Join Brawl!", style=discord.ButtonStyle.success, custom_id="brawl_btn_join", emoji="⚔️")
-    async def join_brawl(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = active_brawls.get(self.message_id)
-        if not match or match['status'] != 'joining':
-            await interaction.response.send_message("This Brawl is no longer accepting players!", ephemeral=True)
-            return
-            
-        uid = str(interaction.user.id)
-        if uid in match['players']:
-            await interaction.response.send_message("You are already in the lobby!", ephemeral=True)
-            return
-            
-        match['players'][uid] = {
-            'name': interaction.user.display_name,
-            'choice': None
-        }
-        await interaction.response.send_message("You joined the Brawl!", ephemeral=True)
-        
-        player_names = [data['name'] for data in match['players'].values()]
-        embed = interaction.message.embeds[0]
-        desc = embed.description.split("**Joined Players:**")[0]
-        embed.description = desc + f"**Joined Players:** {', '.join(player_names)}"
-        try: await interaction.message.edit(embed=embed)
-        except: pass
-
-    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, custom_id="brawl_btn_start")
-    async def start_game(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = active_brawls.get(self.message_id)
-        if not match: return
-        if str(interaction.user.id) != match['host_id']:
-            await interaction.response.send_message("Only the Host can start the game!", ephemeral=True)
-            return
-            
-        if len(match['players']) < 2:
-            await interaction.response.send_message("At least 2 players must join to start!", ephemeral=True)
-            return
-            
-        match['status'] = 'playing'
-        await interaction.response.defer()
-        await spawn_brawl_round(interaction.message, self.message_id, 1)
-
-    @discord.ui.button(label="Cancel Game", style=discord.ButtonStyle.danger, custom_id="brawl_btn_cancel")
-    async def cancel_game(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = active_brawls.get(self.message_id)
-        if not match: return
-        if str(interaction.user.id) != match['host_id']:
-            await interaction.response.send_message("Only the Host can cancel the game!", ephemeral=True)
-            return
-            
-        del active_brawls[self.message_id]
-        await interaction.response.edit_message(content="**Brawl Canceled by Host.**", embed=None, view=None)
-
-class BrawlPlayView(discord.ui.View):
-    def __init__(self, message_id: str):
-        super().__init__(timeout=None)
-        self.message_id = message_id
-        
-    async def handle_lock(self, interaction: discord.Interaction, choice: str):
-        match = active_brawls.get(self.message_id)
-        if not match or match['status'] != 'playing':
-            await interaction.response.send_message("This matches choices are closed!", ephemeral=True)
-            return
-            
-        uid = str(interaction.user.id)
-        if uid not in match['players']:
-            await interaction.response.send_message("You are not part of this Brawl!", ephemeral=True)
-            return
-            
-        if match['players'][uid]['choice'] is not None:
-            await interaction.response.send_message("You already locked in!", ephemeral=True)
-            return
-            
-        match['players'][uid]['choice'] = choice
-        await interaction.response.send_message(f"You securely locked in **{choice.title()}**! 🤫", ephemeral=True)
-        
-        all_locked = all(p['choice'] is not None for p in match['players'].values())
-        if all_locked:
-            match['status'] = 'resolving'
-            try: await interaction.message.edit(view=None)
-            except: pass
-            await resolve_brawl_round(interaction.message, self.message_id, match['round_num'])
-            
-    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_rock", emoji="🪨")
-    async def lock_rock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "rock")
-        
-    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_paper", emoji="📄")
-    async def lock_paper(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "paper")
-        
-    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, custom_id="brawl_btn_scissors", emoji="✂️")
-    async def lock_scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_lock(interaction, "scissors")
-        
-    @discord.ui.button(label="Host: Force Skip AFK", style=discord.ButtonStyle.danger, custom_id="brawl_btn_skip", row=1)
-    async def force_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        match = active_brawls.get(self.message_id)
-        if not match or match['status'] != 'playing': return
-        if str(interaction.user.id) != match['host_id']:
-            await interaction.response.send_message("Only the Host can Force Skip!", ephemeral=True)
-            return
-            
-        afk_uids = [uid for uid, p in match['players'].items() if p['choice'] is None]
-        for uid in afk_uids:
-            del match['players'][uid]
-            
-        if len(match['players']) < 2:
-            del active_brawls[self.message_id]
-            await interaction.response.edit_message(content="Not enough players left. Game ended.", embed=None, view=None)
-            return
-            
-        match['status'] = 'resolving'
-        await interaction.response.defer()
-        try: await interaction.message.edit(view=None)
-        except: pass
-        await resolve_brawl_round(interaction.message, self.message_id, match['round_num'])
-
-async def spawn_brawl_round(msg: discord.Message, message_id: str, round_num: int):
-    match = active_brawls.get(message_id)
-    if not match: return
-    
-    match['round_num'] = round_num
-    for uid in match['players']:
-        match['players'][uid]['choice'] = None
-        
-    match['status'] = 'playing'
-    
-    mentions = " ".join([f"<@{uid}>" for uid in match['players']])
-    embed = discord.Embed(title=f"⚔️ Brawl! Round {round_num} of {match['max_rounds']}", description=f"The match has started! All players, click your throw below securely!\n\n**Players:** {mentions}", color=discord.Color.red())
-    view = BrawlPlayView(message_id)
-    
-    try:
-        await msg.edit(content=mentions, embed=embed, view=view)
-    except Exception as e:
-        print(e)
-        
-async def resolve_brawl_round(msg: discord.Message, message_id: str, round_num: int):
-    match = active_brawls.get(message_id)
-    if not match: return
-    
-    players = match['players']
-    scores_this_round = {uid: 0 for uid in players.keys()}
-    win_map = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
-    
-    for uid1, data1 in players.items():
-        for uid2, data2 in players.items():
-            if uid1 == uid2: continue
-            
-            p1_choice = data1['choice']
-            p2_choice = data2['choice']
-            
-            if win_map[p1_choice] == p2_choice:
-                scores_this_round[uid1] += 1
-                
-    for uid, pts in scores_this_round.items():
-        match['db_scores'][uid] = match['db_scores'].get(uid, 0) + pts
-        
-    embed = discord.Embed(title=f"⚔️ Brawl Results (Round {round_num} of {match['max_rounds']})", color=discord.Color.purple())
-    
-    choice_groups = {"rock": [], "paper": [], "scissors": []}
-    for uid, data in players.items():
-        choice_groups[data['choice']].append(data['name'])
-        
-    desc = ""
-    if choice_groups["rock"]: desc += f"🪨 **Rock:** {', '.join(choice_groups['rock'])}\n"
-    if choice_groups["paper"]: desc += f"📄 **Paper:** {', '.join(choice_groups['paper'])}\n"
-    if choice_groups["scissors"]: desc += f"✂️ **Scissors:** {', '.join(choice_groups['scissors'])}\n"
-        
-    desc += "\n**Match Leaderboard:**\n"
-    sorted_scores = sorted(match['db_scores'].items(), key=lambda x: x[1], reverse=True)
-    for uid, total_pts in sorted_scores:
-        round_pts = scores_this_round.get(uid, 0)
-        if round_pts > 0: desc += f"<@{uid}>: **{total_pts}** pts (+{round_pts})\n"
-        else: desc += f"<@{uid}>: **{total_pts}** pts\n"
-        
-    embed.description = desc
-    
-    view = discord.ui.View(timeout=None)
-    if round_num < match['max_rounds']:
-        next_btn = discord.ui.Button(label=f"Host: Start Round {round_num + 1}", style=discord.ButtonStyle.primary, emoji="🔥")
-        async def next_round_cb(btn_int: discord.Interaction):
-            if str(btn_int.user.id) != match['host_id']:
-                await btn_int.response.send_message("Only the Host can start the next round!", ephemeral=True)
-                return
-            await btn_int.response.defer()
-            await spawn_brawl_round(msg, message_id, round_num + 1)
-        next_btn.callback = next_round_cb
-        view.add_item(next_btn)
-        
-    end_btn = discord.ui.Button(label="Host: End Game", style=discord.ButtonStyle.danger)
-    async def end_cb(btn_int: discord.Interaction):
-        if str(btn_int.user.id) != match['host_id']:
-            await btn_int.response.send_message("Only the Host can end the game!", ephemeral=True)
-            return
-            
-        del active_brawls[message_id]
-        embed.title = "🏆 Final Brawl Results"
-        await btn_int.response.edit_message(embed=embed, view=None)
-        
-        # Save points to DB here if we wanted persistent points! 
-        # (For now the user requested a unified session wipe, so we skip standard DB saving, 
-        #  but we COULD integrate it into the general rps_scores).
-        
-    end_btn.callback = end_cb
-    view.add_item(end_btn)
-    
-    try: await msg.edit(content=None, embed=embed, view=view)
-    except: pass
-
 async def tz_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     choices = [app_commands.Choice(name="UTC", value="UTC")]
     
@@ -2928,26 +2729,58 @@ async def set_timezone_slash(interaction: discord.Interaction, timezone: str):
     else:
         await interaction.response.send_message(f"❌ Failed to set timezone. Please type a valid timezone like 'America/New_York' or 'Asia/Kolkata'. You provided: {timezone}", ephemeral=True)
 
-# @bot.tree.command(name="brawl", description="Start a multiplayer RPS Brawl!")
-# @app_commands.describe(max_rounds="Number of rounds (Default 3, Max 10)")
-# @app_commands.allowed_contexts(guilds=True)
-# async def brawl_slash(interaction: discord.Interaction, max_rounds: app_commands.Range[int, 1, 10] = 3):
-    message_id = f"{interaction.id}"
+@bot.tree.command(name="show_event", description="Show details of an active event/timer")
+@app_commands.autocomplete(label=timer_autocomplete)
+@app_commands.describe(label="The name of the event to show")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def show_event_slash(interaction: discord.Interaction, label: str):
+    data = load_data()
+    context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+    if context_id not in data or "timers" not in data[context_id]:
+        await interaction.response.send_message(f"❌ No active timers found.", ephemeral=True)
+        return
+        
+    found_timer = None
+    for t in data[context_id]["timers"]:
+        if t['label'].lower() == label.lower():
+            found_timer = t
+            break
+            
+    if not found_timer:
+        await interaction.response.send_message(f"❌ Timer **{label}** not found.", ephemeral=True)
+        return
+        
+    ts = found_timer['end_epoch']
+    recur = found_timer.get('recurrence_seconds', 0)
+    owner = found_timer.get('owner_id', 'Unknown')
+    role_id = found_timer.get('role_id', '')
+    desc = found_timer.get('description', '')
+    notify = found_timer.get('notify_method', 'channel')
+    reminders = found_timer.get('reminders', [])
     
-    active_brawls[message_id] = {
-        'host_id': str(interaction.user.id),
-        'max_rounds': max_rounds,
-        'status': 'joining',
-        'round_num': 1,
-        'db_scores': {str(interaction.user.id): 0},
-        'players': {
-            str(interaction.user.id): {'name': interaction.user.display_name, 'choice': None}
-        }
-    }
+    embed = discord.Embed(title=f"📅 Event: {found_timer['label']}", color=discord.Color.blue())
+    embed.add_field(name="Next Occurrence", value=f"<t:{ts}:F>\n(<t:{ts}:R>)", inline=False)
     
-    embed = discord.Embed(title="⚔️ RPS Brawl Lobby!", description=f"<@{interaction.user.id}> started a Brawl! Click **Join Brawl!** if you want to play.\n\n**Joined Players:** {interaction.user.display_name}", color=discord.Color.purple())
-    view = BrawlJoinView(message_id)
-    await interaction.response.send_message(embed=embed, view=view)
+    if recur > 0:
+        embed.add_field(name="Recurring", value=f"Every {recur} seconds", inline=True)
+    else:
+        embed.add_field(name="Recurring", value="No", inline=True)
+        
+    embed.add_field(name="Owner", value=f"<@{owner}>", inline=True)
+    
+    if role_id:
+        embed.add_field(name="Tags Role", value=f"<@&{role_id}>", inline=True)
+        
+    embed.add_field(name="Notification Method", value=notify, inline=True)
+    
+    if reminders:
+        embed.add_field(name="Early Reminders", value=f"{len(reminders)} reminder(s) set", inline=True)
+        
+    if desc:
+        embed.add_field(name="Description", value=desc, inline=False)
+        
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 
@@ -3207,7 +3040,8 @@ async def check_timers():
             reminders = timer.get("reminders", [])
             sent = timer.get("sent_reminders", [])
             
-            remain = timer["end_epoch"] - current_time
+            target_epoch = timer.get("override_epoch", timer["end_epoch"])
+            remain = target_epoch - current_time
             
             for r_sec in reminders:
                 if r_sec in sent: continue
@@ -3230,7 +3064,7 @@ async def check_timers():
                      try:
                         if guild:
                             # Fallback: Send to dashboard channel if exists
-                            db_ch_id = context_data.get("dashboard_channel_id")
+                            db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
                             if db_ch_id:
                                 ch = guild.get_channel(db_ch_id)
                                 if ch: await ch.send(msg)
@@ -3243,7 +3077,7 @@ async def check_timers():
                      data_changed = True
 
             # --- 5-Minute Early Tag ---
-            dur = timer["end_epoch"] - timer.get("start_epoch", timer["end_epoch"] - 301)
+            dur = target_epoch - timer.get("start_epoch", target_epoch - 301)
             if dur >= 300:
                 if remain <= 300 and remain > -60 and "5min_ping" not in sent:
                     msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
@@ -3258,7 +3092,7 @@ async def check_timers():
 
                     try:
                         if guild:
-                            db_ch_id = context_data.get("dashboard_channel_id")
+                            db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
                             if db_ch_id:
                                 ch = guild.get_channel(db_ch_id)
                                 if ch: await ch.send(content)
@@ -3271,7 +3105,7 @@ async def check_timers():
                     data_changed = True
 
             # --- Expiry Check ---
-            if current_time >= timer["end_epoch"]:
+            if current_time >= target_epoch:
                 expired_timers.append(timer)
             else:
                 active_timers.append(timer)
@@ -3289,12 +3123,13 @@ async def check_timers():
             try:
                 if guild:
                     # Find Channel: Dashboard Channel
-                    db_ch_id = context_data.get("dashboard_channel_id")
+                    db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
                     channel = guild.get_channel(db_ch_id) if db_ch_id else None
                     if channel:
                          content = msg
                          # Ping at expiry only if timer was too short for the 5-min warning
-                         dur = timer["end_epoch"] - timer.get("start_epoch", timer["end_epoch"] - 301)
+                         target_epoch_expiry = timer.get("override_epoch", timer["end_epoch"])
+                         dur = target_epoch_expiry - timer.get("start_epoch", target_epoch_expiry - 301)
                          if dur < 300:
                              if "Ping Role" in notify and role_id:
                                   content += f" <@&{role_id}>"
@@ -3306,7 +3141,7 @@ async def check_timers():
                     # DM Context
                     if "Chat" in notify:
                         # Try to send to the dashboard channel (Group DM or DM)
-                        db_ch_id = context_data.get("dashboard_channel_id")
+                        db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
                         try:
                             # Try fetch if not cached (Group DMs often need fetch)
                             ch = bot.get_channel(db_ch_id) or await bot.fetch_channel(db_ch_id)
@@ -3322,8 +3157,14 @@ async def check_timers():
                 logger.error(f"Failed to send alert: {e}")
 
             # Recurrence
-            if timer["recurrence_seconds"] > 0:
-                timer["end_epoch"] += timer["recurrence_seconds"]
+            recur = timer.get("recurrence_seconds", 0)
+            if recur > 0:
+                if "override_epoch" in timer:
+                    del timer["override_epoch"]
+                    
+                next_time = timer["end_epoch"] + recur
+                while next_time <= current_time: next_time += recur
+                timer["end_epoch"] = next_time
                 timer["start_epoch"] = current_time
                 timer["sent_reminders"] = [] # Reset reminders
                 active_timers.append(timer)
@@ -3334,11 +3175,17 @@ async def check_timers():
                      # Fire and forget delete old
                      asyncio.create_task(delete_discord_event(guild, timer["discord_event_id"]))
                      dur = timer.get("event_duration", 900)
-                     # Create new
-                     # Note: This await in loop might slow things down but ensures ID is saved.
-                     # Given volume, likely fine.
-                     new_id = await create_discord_event(guild, timer["label"], timer["end_epoch"], dur)
-                     timer["discord_event_id"] = new_id
+                     
+                     # Only recreate if it has a role ping, as per new rules
+                     if timer.get("role_id"):
+                         try:
+                             new_id = await create_discord_event(guild, timer["label"], timer["end_epoch"], dur)
+                             timer["discord_event_id"] = new_id
+                         except Exception as e:
+                             logger.error(f"Failed to recreate Discord Event: {e}")
+                             timer["discord_event_id"] = None
+                     else:
+                         timer["discord_event_id"] = None
 
             
         context_data["timers"] = active_timers
@@ -3414,6 +3261,29 @@ async def on_ready():
 
     bot.add_view(DashboardView())
     await check_missed_events()
+    
+    # Cleanup Discord Events without Role Pings
+    logger.info("Cleaning up Discord Scheduled Events without Role Pings...")
+    data = load_data()
+    data_changed = False
+    for context_id, ctx_data in data.items():
+        if "timers" in ctx_data:
+            guild = bot.get_guild(int(context_id)) if context_id.isdigit() else None
+            if not guild: continue
+            
+            for t in ctx_data["timers"]:
+                if t.get("discord_event_id") and not t.get("role_id"):
+                    try:
+                        await delete_discord_event(guild, t["discord_event_id"])
+                        logger.info(f"Deleted Discord Event for {t['label']} because it has no role ping.")
+                    except: pass
+                    t["discord_event_id"] = None
+                    data_changed = True
+                    
+    if data_changed:
+        save_data(data)
+        logger.info("Saved data after event cleanup.")
+        
     if not check_timers.is_running(): check_timers.start()
 
 
