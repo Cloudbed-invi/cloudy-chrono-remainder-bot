@@ -2693,6 +2693,8 @@ async def check_missed_events():
         except Exception as e:
             logger.error(f"Dashboard refresh error in check_missed_events: {e}")
 
+async def resolve_rps_match(msg: discord.Message, match_id: str, p1_choice: str = None, p2_choice: str = None):
+    import random
     import os
     import asyncio
     import time
