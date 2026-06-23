@@ -205,6 +205,8 @@ bot = StratusBot()
 
 # --- Data Management (Turso Legacy Storage) ---
 from db_turso import load_legacy_data as load_data, save_legacy_data as save_data
+import asyncio
+db_lock = asyncio.Lock()
 
 # --- Autocomplete Helper ---
 async def timer_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -246,21 +248,22 @@ def get_user_tz_str(user_id: int) -> str:
     prefs = data.get("USER_PREFS", {})
     return prefs.get(str(user_id), "UTC")
 
-def set_user_tz_str(user_id: int, tz_str: str) -> bool:
-    data = load_data()
-    if "USER_PREFS" not in data:
-        data["USER_PREFS"] = {}
-    
-    try:
-        if tz_str.upper() == "UTC":
-            data["USER_PREFS"][str(user_id)] = "UTC"
-        else:
-            zoneinfo.ZoneInfo(tz_str)
-            data["USER_PREFS"][str(user_id)] = tz_str
-        save_data(data)
-        return True
-    except:
-        return False
+async def set_user_tz_str(user_id: int, tz_str: str) -> bool:
+    async with db_lock:
+        data = load_data()
+        if "USER_PREFS" not in data:
+            data["USER_PREFS"] = {}
+        
+        try:
+            if tz_str.upper() == "UTC":
+                data["USER_PREFS"][str(user_id)] = "UTC"
+            else:
+                zoneinfo.ZoneInfo(tz_str)
+                data["USER_PREFS"][str(user_id)] = tz_str
+            save_data(data)
+            return True
+        except:
+            return False
 
 # --- Helpers ---
 def parse_duration_string(input_str: str) -> int:
@@ -553,6 +556,58 @@ user_setup_state: dict[int, dict[str, Any]] = {}
 # Format: {user_id: {"step": str, "guild_id": int, "data": {"label": ..., "end_epoch": ..., etc}}}
 
 # --- UI Components ---
+class EditShiftView(discord.ui.View):
+    def __init__(self, guild_id: str, timer_index: int, new_end: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.timer_index = timer_index
+        self.new_end = new_end
+        
+    @discord.ui.button(label="Upcoming Only", style=discord.ButtonStyle.primary, emoji="⏭️")
+    async def btn_upcoming(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_shift(interaction, override=True)
+        
+    @discord.ui.button(label="All Future", style=discord.ButtonStyle.danger, emoji="🔄")
+    async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_shift(interaction, override=False)
+        
+    async def _apply_shift(self, interaction: discord.Interaction, override: bool):
+        success = False
+        async with db_lock:
+            data = load_data()
+            if self.guild_id in data and "timers" in data[self.guild_id]:
+                timers = data[self.guild_id]["timers"]
+                if 0 <= self.timer_index < len(timers):
+                    t = timers[self.timer_index]
+                    if override:
+                        t["override_epoch"] = self.new_end
+                    else:
+                        t["end_epoch"] = self.new_end
+                        t["start_epoch"] = int(time.time())
+                        t["sent_reminders"] = []
+                        if "override_epoch" in t: del t["override_epoch"]
+                        
+                    if t.get("discord_event_id"):
+                        dur = t.get("event_duration", 900)
+                        await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], self.new_end, dur)
+                        
+                    timers.sort(key=lambda x: x["end_epoch"])
+                    save_data(data)
+                    success = True
+        
+        for child in self.children: child.disabled = True
+        await interaction.response.edit_message(view=self)
+        
+        if success:
+            guild = bot.get_guild(int(self.guild_id))
+            if guild: await update_dashboard(guild, data[self.guild_id], resend=True)
+            msg = await interaction.followup.send("✅ Time shifted successfully!", ephemeral=True)
+            await asyncio.sleep(5)
+            try: await msg.delete()
+            except: pass
+        else:
+            await interaction.followup.send("❌ Timer not found.", ephemeral=True)
+
 class EditTimerModal(discord.ui.Modal, title="Edit Timer"):
     def __init__(self, guild_id: str, timer_index: int, current_label: str):
         super().__init__()
@@ -611,45 +666,59 @@ class EditTimerModal(discord.ui.Modal, title="Edit Timer"):
             await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
             return
 
-        data = load_data()
-        if self.guild_id in data and "timers" in data[self.guild_id]:
-            timers = data[self.guild_id]["timers"]
-            if 0 <= self.timer_index < len(timers):
-                t = timers[self.timer_index]
-                
-                # Update core fields
-                if new_end is not None:
-                    t["end_epoch"] = new_end
-                    t["start_epoch"] = int(time.time())
-                    # Reset reminders on time change
-                    t["sent_reminders"] = []
-                if new_recur is not None:
-                    t["recurrence_seconds"] = new_recur
-                if new_image is not None:
-                    t["image_url"] = new_image
-                elif clear_image and "image_url" in t:
-                    del t["image_url"]
-                
-                if new_duration is not None: t["event_duration"] = new_duration
-                if new_reminders is not None: 
-                    t["reminders"] = new_reminders
-                    t["sent_reminders"] = []
+        success = False
+        requires_shift_choice = False
+        
+        async with db_lock:
+            data = load_data()
+            if self.guild_id in data and "timers" in data[self.guild_id]:
+                timers = data[self.guild_id]["timers"]
+                if 0 <= self.timer_index < len(timers):
+                    t = timers[self.timer_index]
+                    
+                    # Update core fields
+                    if new_end is not None:
+                        if t.get("recurrence_seconds", 0) > 0:
+                            requires_shift_choice = True
+                        else:
+                            t["end_epoch"] = new_end
+                            t["start_epoch"] = int(time.time())
+                            t["sent_reminders"] = []
+                            if "override_epoch" in t: del t["override_epoch"]
+                    if new_recur is not None:
+                        t["recurrence_seconds"] = new_recur
+                    if new_image is not None:
+                        t["image_url"] = new_image
+                    elif clear_image and "image_url" in t:
+                        del t["image_url"]
+                    
+                    if new_duration is not None: t["event_duration"] = new_duration
+                    if new_reminders is not None: 
+                        t["reminders"] = new_reminders
+                        t["sent_reminders"] = []
+    
+                    # Update Discord Event (Note: This is an await inside lock, but it's okay because it's a direct user interaction and very fast)
+                    if t.get("discord_event_id") and not requires_shift_choice:
+                        dur = t.get("event_duration", 900)
+                        await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t["end_epoch"], dur)
+    
+                    timers.sort(key=lambda x: x["end_epoch"])
+                    save_data(data)
+                    success = True
 
-                # Update Discord Event
-                if t.get("discord_event_id"):
-                    dur = t.get("event_duration", 900)
-                    await update_discord_event(interaction.guild, t["discord_event_id"], t["label"], t["end_epoch"], dur)
+        if requires_shift_choice:
+            view = EditShiftView(self.guild_id, self.timer_index, new_end)
+            await interaction.followup.send("Do you want to apply this new time to **only the upcoming occurrence**, or **all future occurrences**?", view=view, ephemeral=True)
+            return
 
-                timers.sort(key=lambda x: x["end_epoch"])
-                save_data(data)
-                
-                await update_dashboard(interaction.guild, data[self.guild_id], resend=True)
-                msg = await interaction.followup.send(f"✅ Timer Updated!", ephemeral=True)
-                await asyncio.sleep(5)
-                try: await msg.delete()
-                except: pass
-            else:
-                await interaction.followup.send(f"❌ Timer not found.", ephemeral=True)
+        if success:
+            await update_dashboard(interaction.guild, data[self.guild_id], resend=True)
+            msg = await interaction.followup.send(f"✅ Timer Updated!", ephemeral=True)
+            await asyncio.sleep(5)
+            try: await msg.delete()
+            except: pass
+        else:
+            await interaction.followup.send("❌ Timer not found.", ephemeral=True)
 
 class RecurringAlertView(discord.ui.View):
     def __init__(self, guild_id: str, timer_index: int):
@@ -770,24 +839,28 @@ class ManageTimersView(discord.ui.View):
             except: pass
             
             await interaction.response.defer(ephemeral=True)
-            data = load_data()
-            if self.guild_id in data and "timers" in data[self.guild_id]:
-                if 0 <= self.selected_index < len(data[self.guild_id]["timers"]):
-                    removed = data[self.guild_id]["timers"].pop(self.selected_index)
-                    
-                    # Delete Event
-                    if removed.get("discord_event_id"):
-                         await delete_discord_event(interaction.guild, removed["discord_event_id"])
-                    
-                    save_data(data)
-                    await update_dashboard(interaction.guild, data[self.guild_id], resend=True)
-                    
-                    msg = await interaction.followup.send(f"✅ Deleted **{removed['label']}**", ephemeral=True)
-                    await asyncio.sleep(5)
-                    try: await msg.delete()
-                    except: pass
-                    try: await interaction.message.delete()
-                    except: pass
+            async with db_lock:
+                data = load_data()
+                if self.guild_id in data and "timers" in data[self.guild_id]:
+                    if 0 <= self.selected_index < len(data[self.guild_id]["timers"]):
+                        removed = data[self.guild_id]["timers"].pop(self.selected_index)
+                        save_data(data)
+                    else: removed = None
+                else: removed = None
+                
+            if removed:
+                # Delete Event
+                if removed.get("discord_event_id"):
+                     await delete_discord_event(interaction.guild, removed["discord_event_id"])
+                
+                await update_dashboard(interaction.guild, data[self.guild_id], resend=True)
+                
+                msg = await interaction.followup.send(f"✅ Deleted **{removed['label']}**", ephemeral=True)
+                await asyncio.sleep(5)
+                try: await msg.delete()
+                except: pass
+                try: await interaction.message.delete()
+                except: pass
 
 class TimerDetailsModal(discord.ui.Modal, title="Configure Operation"):
     def __init__(self, mode: str, notify_method: str, role_id: int, user_tz: str, default_label: str | None = None, default_time: str | None = None, template_type: str | None = None):
@@ -1017,37 +1090,39 @@ class TimerWizardView(discord.ui.View):
             
             # Create Special Timer Logic directly without Modal
             await interaction.response.defer(ephemeral=True)
-            data = load_data()
-            guild_id = str(interaction.guild_id)
-            if guild_id not in data: data[guild_id] = {"timers": []}
-            if "timers" not in data[guild_id]: data[guild_id]["timers"] = []
-
-            # Check for existing Foundry Job
-            jobs = [t for t in data[guild_id]["timers"] if t.get("type") == "foundry_job"]
-            if jobs:
-                await interaction.followup.send("❌ **Foundry Automation** is already active. Delete the old one first.", ephemeral=True)
-                return
-
-            label = f"🔥 Foundry Automation (Lead: {self.foundry_lead.mention})"
-            end_epoch = get_next_foundry_target()
-            
-            new_job = {
-                "label": label,
-                "end_epoch": end_epoch,
-                "start_epoch": int(time.time()),
-                "owner_id": self.foundry_lead.id, # The Lead is the Owner
-                "role_id": None,
-                "notify_method": "DM", # Internal flag
-                "mode": "auto",
-                "recurrence_seconds": 604800, # 7 Days
-                "type": "foundry_job",
-                "reminders": [],
-                "sent_reminders": []
-            }
-            
-            data[guild_id]["timers"].append(new_job)
-            data[guild_id]["timers"].sort(key=lambda x: x["end_epoch"])
-            save_data(data)
+            async with db_lock:
+                data = load_data()
+                guild_id = str(interaction.guild_id)
+                if guild_id not in data: data[guild_id] = {"timers": []}
+                if "timers" not in data[guild_id]: data[guild_id]["timers"] = []
+    
+                # Check for existing Foundry Job
+                jobs = [t for t in data[guild_id]["timers"] if t.get("type") == "foundry_job"]
+                if jobs:
+                    await interaction.followup.send("❌ **Foundry Automation** is already active. Delete the old one first.", ephemeral=True)
+                    return
+    
+                label = f"🔥 Foundry Automation (Lead: {self.foundry_lead.mention})"
+                end_epoch = get_next_foundry_target()
+                
+                new_job = {
+                    "label": label,
+                    "end_epoch": end_epoch,
+                    "start_epoch": int(time.time()),
+                    "owner_id": self.foundry_lead.id, # The Lead is the Owner
+                    "role_id": None,
+                    "notify_method": "DM", # Internal flag
+                    "mode": "auto",
+                    "recurrence_seconds": 604800, # 7 Days
+                    "type": "foundry_job",
+                    "reminders": [],
+                    "sent_reminders": []
+                }
+                
+                data[guild_id]["timers"].append(new_job)
+                data[guild_id]["timers"].sort(key=lambda x: x["end_epoch"])
+                save_data(data)
+                
             await update_dashboard(interaction.guild, data[guild_id], resend=True)
             await interaction.followup.send(f"✅ **Foundry Automation Active!**\nI will DM {self.foundry_lead.mention} every other Wednesday.", ephemeral=True)
             return
@@ -1585,25 +1660,32 @@ class RecurrenceSuggestionView(discord.ui.View):
         self.add_item(btn)
         
     async def make_recurring(self, interaction: discord.Interaction):
-        data = load_data()
-        if self.context_id in data and "timers" in data[self.context_id]:
-            for t in data[self.context_id]["timers"]:
-                if t['label'].lower() == self.label.lower():
-                    if not check_permissions(interaction, t['owner_id']):
-                        await interaction.response.send_message("❌ You can only modify your own timers.", ephemeral=True)
-                        return
-                    
-                    t["recurrence_seconds"] = self.interval
-                    save_data(data)
-                    if not self.is_dm and interaction.guild:
-                        await update_dashboard(interaction.guild, data[self.context_id], resend=True)
-                    
-                    await interaction.response.send_message(f"✅ Awesome! **{self.label}** is now a recurring event repeating every {self.interval_str}.", ephemeral=True)
-                    
-                    # Disable button
-                    for item in self.children: item.disabled = True
-                    await interaction.message.edit(view=self)
-                    return
+        success = False
+        async with db_lock:
+            data = load_data()
+            if self.context_id in data and "timers" in data[self.context_id]:
+                for t in data[self.context_id]["timers"]:
+                    if t['label'].lower() == self.label.lower():
+                        if not check_permissions(interaction, t['owner_id']):
+                            await interaction.response.send_message("❌ You can only modify your own timers.", ephemeral=True)
+                            return
+                        
+                        t["recurrence_seconds"] = self.interval
+                        save_data(data)
+                        success = True
+                        break
+        
+        if success:
+            if not self.is_dm and interaction.guild:
+                await update_dashboard(interaction.guild, data[self.context_id], resend=True)
+                
+            await interaction.response.send_message(f"✅ Awesome! **{self.label}** is now a recurring event repeating every {self.interval_str}.", ephemeral=True)
+            
+            # Disable button
+            for item in self.children: item.disabled = True
+            await interaction.message.edit(view=self)
+            return
+            
         await interaction.response.send_message("❌ Timer not found. It may have already expired.", ephemeral=True)
 
 # --- Core Logic ---
@@ -1612,62 +1694,63 @@ async def add_timer(interaction: discord.Interaction, label: str, end_epoch: int
     context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
     is_dm = interaction.guild is None
 
-    data = load_data()
-    if context_id not in data: data[context_id] = {"timers": []}
-    if "timers" not in data[context_id]: data[context_id]["timers"] = []
-    
     # Create Discord Event (Only if Guild and has a role ping)
     discord_event_id = None
     if not is_dm and mode != "silent" and role_id:
          discord_event_id = await create_discord_event(interaction.guild, label, end_epoch, event_duration, description=description)
     
-    # Save Timer
-    new_timer = {
-        "label": label,
-        "end_epoch": end_epoch,
-        "start_epoch": int(time.time()),
-        "owner_id": interaction.user.id,
-        "role_id": role_id if not is_dm else None,
-        "notify_method": notify_method,
-        "mode": mode,
-        "recurrence_seconds": recurrence_seconds,
-        "image_url": image_url,
-        "discord_event_id": discord_event_id,
-        "event_duration": event_duration,
-        "reminders": reminders or [],
-        "sent_reminders": [],
-        "description": description
-    }
+    async with db_lock:
+        data = load_data()
+        if context_id not in data: data[context_id] = {"timers": []}
+        if "timers" not in data[context_id]: data[context_id]["timers"] = []
+        
+        # Save Timer
+        new_timer = {
+            "label": label,
+            "end_epoch": end_epoch,
+            "start_epoch": int(time.time()),
+            "owner_id": interaction.user.id,
+            "role_id": role_id if not is_dm else None,
+            "notify_method": notify_method,
+            "mode": mode,
+            "recurrence_seconds": recurrence_seconds,
+            "image_url": image_url,
+            "discord_event_id": discord_event_id,
+            "event_duration": event_duration,
+            "reminders": reminders or [],
+            "sent_reminders": [],
+            "description": description
+        }
+        
+        data[context_id]["timers"].append(new_timer)
+        data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
+        
+        # Task 5 & 6: History Tracking & Recurrence Detection
+        suggest_view = None
+        if recurrence_seconds == 0:
+            hist = data[context_id].setdefault("history", {})
+            lbl_key = label.lower()
+            
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(end_epoch, timezone.utc)
+            time_str = dt.strftime("%H:%M")
+            
+            history_list = hist.get(lbl_key, [])
+            history_list.append({"epoch": end_epoch, "time_str": time_str})
+            history_list = history_list[-5:]
+            hist[lbl_key] = history_list
+            
+            if len(history_list) >= 3:
+                last_3 = history_list[-3:]
+                if last_3[0]["time_str"] == last_3[1]["time_str"] == last_3[2]["time_str"]:
+                    diff1 = last_3[1]["epoch"] - last_3[0]["epoch"]
+                    diff2 = last_3[2]["epoch"] - last_3[1]["epoch"]
+                    
+                    # Check if strictly positive, matching, and a multiple of a day (or exact)
+                    if diff1 > 0 and diff1 == diff2 and (diff1 % 86400 == 0):
+                        suggest_view = RecurrenceSuggestionView(context_id, label, diff1, get_interval_str(diff1), is_dm)
     
-    data[context_id]["timers"].append(new_timer)
-    data[context_id]["timers"].sort(key=lambda x: x["end_epoch"])
-    
-    # Task 5 & 6: History Tracking & Recurrence Detection
-    suggest_view = None
-    if recurrence_seconds == 0:
-        hist = data[context_id].setdefault("history", {})
-        lbl_key = label.lower()
-        
-        from datetime import datetime, timezone
-        dt = datetime.fromtimestamp(end_epoch, timezone.utc)
-        time_str = dt.strftime("%H:%M")
-        
-        history_list = hist.get(lbl_key, [])
-        history_list.append({"epoch": end_epoch, "time_str": time_str})
-        history_list = history_list[-5:]
-        hist[lbl_key] = history_list
-        
-        if len(history_list) >= 3:
-            last_3 = history_list[-3:]
-            if last_3[0]["time_str"] == last_3[1]["time_str"] == last_3[2]["time_str"]:
-                diff1 = last_3[1]["epoch"] - last_3[0]["epoch"]
-                diff2 = last_3[2]["epoch"] - last_3[1]["epoch"]
-                
-                # Check if strictly positive, matching, and a multiple of a day (or exact)
-                if diff1 > 0 and diff1 == diff2 and (diff1 % 86400 == 0):
-                    suggest_view = RecurrenceSuggestionView(context_id, label, diff1, get_interval_str(diff1), is_dm)
-
-    save_data(data)
+        save_data(data)
     
     # Confirmation Embed
     ts = int(end_epoch)
@@ -1765,9 +1848,10 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
         view = DashboardView()
 
         if resend:
+            dashboard_msg_ids = [d.get("message_id") for d in data["dashboards"]]
             try:
                 async for p in channel.pins():
-                    if p.author == bot.user and p.id != db_msg_id:
+                    if p.author == bot.user and p.id not in dashboard_msg_ids:
                         try: await p.unpin(); await p.delete()
                         except: pass
             except: pass
@@ -1798,7 +1882,16 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
             try:
                 message = await channel.fetch_message(db_msg_id)
                 await message.edit(embed=embed, view=view)
-            except: pass
+                valid_dashboards.append(dashboard)
+            except:
+                dashboards_modified = True # failed to update, drop it
+
+    if dashboards_modified:
+        async with db_lock:
+            fresh_data = load_data()
+            if str(guild_or_user.id) in fresh_data:
+                fresh_data[str(guild_or_user.id)]["dashboards"] = valid_dashboards
+                save_data(fresh_data)
 
 
 # --- Setup Logic ---
@@ -1839,21 +1932,25 @@ async def run_setup(guild, channel):
                  break
     except: pass
 
-    if "timers" not in data[guild_id]: data[guild_id]["timers"] = []
-    if "dashboards" not in data[guild_id]: data[guild_id]["dashboards"] = []
-    
-    existing = next((d for d in data[guild_id]["dashboards"] if d["name"] == "Main Dashboard"), None)
-    if existing:
-        existing["channel_id"] = channel.id
-        existing["message_id"] = message.id
-    else:
-        data[guild_id]["dashboards"].append({
-            "name": "Main Dashboard",
-            "channel_id": channel.id,
-            "message_id": message.id
-        })
+    async with db_lock:
+        data = load_data()
+        if guild_id not in data: data[guild_id] = {}
+        if "timers" not in data[guild_id]: data[guild_id]["timers"] = []
+        if "dashboards" not in data[guild_id]: data[guild_id]["dashboards"] = []
         
-    save_data(data)
+        existing = next((d for d in data[guild_id]["dashboards"] if d["name"] == "Main Dashboard"), None)
+        if existing:
+            existing["channel_id"] = channel.id
+            existing["message_id"] = message.id
+        else:
+            data[guild_id]["dashboards"].append({
+                "name": "Main Dashboard",
+                "channel_id": channel.id,
+                "message_id": message.id
+            })
+            
+        save_data(data)
+        
     await update_dashboard(guild, data[guild_id])
     return message.jump_url
 
@@ -1890,6 +1987,43 @@ async def refresh_slash(interaction: discord.Interaction):
     else:
         await run_setup(interaction.guild, interaction.channel)
         await interaction.followup.send("✅ **Dashboard Initialized & Pinned!**", ephemeral=True)
+
+@bot.tree.command(name="cleanup_events", description="Clean up orphaned or silent Discord Server Events")
+@app_commands.checks.has_permissions(administrator=True)
+async def cleanup_events_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild: return
+    
+    events = await guild.fetch_scheduled_events()
+    data = load_data()
+    guild_id = str(guild.id)
+    timers = data.get(guild_id, {}).get("timers", [])
+    
+    deleted_count = 0
+    # Create a set of valid event ids that SHOULD exist (they have role pings)
+    valid_event_ids = {t["discord_event_id"] for t in timers if t.get("discord_event_id") and t.get("role_id") and t.get("mode", "") != "silent"}
+    
+    for event in events:
+        # Check if the event is orphaned or shouldn't exist
+        if event.id not in valid_event_ids and event.creator == bot.user:
+            try:
+                await event.delete()
+                deleted_count += 1
+            except: pass
+            
+    # Also clean up DB references that are invalid
+    async with db_lock:
+        fresh_data = load_data()
+        modified = False
+        for t in fresh_data.get(guild_id, {}).get("timers", []):
+            if t.get("discord_event_id") and (not t.get("role_id") or t.get("mode", "") == "silent"):
+                t["discord_event_id"] = None
+                modified = True
+        if modified:
+            save_data(fresh_data)
+            
+    await interaction.followup.send(f"✅ **Cleanup Complete:** Removed {deleted_count} unnecessary Discord events.", ephemeral=True)
 
 @bot.command()
 async def sync(ctx):
@@ -2016,27 +2150,28 @@ async def remind_slash(interaction: discord.Interaction, request: str):
                 await interaction.followup.send(f"❌ Could not find a member matching `{target_name}`.", ephemeral=True)
                 return
                 
-            data = load_data()
-            context_id = str(interaction.guild_id)
-            if context_id not in data: data[context_id] = {}
-            if "timing_managers" not in data[context_id]: data[context_id]["timing_managers"] = []
-            
-            mgrs = data[context_id]["timing_managers"]
-            
-            if action == "add_manager":
-                if target_member.id not in mgrs:
-                    mgrs.append(target_member.id)
-                    save_data(data)
-                    await interaction.followup.send(f"✅ **{target_member.display_name}** has been added to the Timing Managers list.", ephemeral=True)
+            async with db_lock:
+                data = load_data()
+                context_id = str(interaction.guild_id)
+                if context_id not in data: data[context_id] = {}
+                if "timing_managers" not in data[context_id]: data[context_id]["timing_managers"] = []
+                
+                mgrs = data[context_id]["timing_managers"]
+                
+                if action == "add_manager":
+                    if target_member.id not in mgrs:
+                        mgrs.append(target_member.id)
+                        save_data(data)
+                        await interaction.followup.send(f"✅ **{target_member.display_name}** has been added to the Timing Managers list.", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"⚠️ **{target_member.display_name}** is already a Timing Manager.", ephemeral=True)
                 else:
-                    await interaction.followup.send(f"⚠️ **{target_member.display_name}** is already a Timing Manager.", ephemeral=True)
-            else:
-                if target_member.id in mgrs:
-                    mgrs.remove(target_member.id)
-                    save_data(data)
-                    await interaction.followup.send(f"✅ **{target_member.display_name}** has been removed from the Timing Managers list.", ephemeral=True)
-                else:
-                    await interaction.followup.send(f"⚠️ **{target_member.display_name}** is not in the Timing Managers list.", ephemeral=True)
+                    if target_member.id in mgrs:
+                        mgrs.remove(target_member.id)
+                        save_data(data)
+                        await interaction.followup.send(f"✅ **{target_member.display_name}** has been removed from the Timing Managers list.", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"⚠️ **{target_member.display_name}** is not in the Timing Managers list.", ephemeral=True)
             return
 
         # 1.5 SET CYCLE ACTION
@@ -2066,50 +2201,57 @@ async def remind_slash(interaction: discord.Interaction, request: str):
             try: interval_sec = parse_duration_string(interval_str) if interval_str else 1209600
             except: interval_sec = 1209600
             
-            data = load_data()
-            context_id = str(interaction.guild_id)
-            if context_id not in data: data[context_id] = {}
-            if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
-            
-            cycles = data[context_id]["cycles"]
-            cycle = next((c for c in cycles if c['name'].lower() == label.lower()), None)
-            if cycle:
-                cycle['start_epoch'] = start_epoch
-                cycle['duration_sec'] = duration_sec
-                cycle['interval_sec'] = interval_sec
-                cycle['pre_dm_sent'] = False
-                cycle['post_dm_sent'] = False
-                await interaction.followup.send(f"✅ Updated event cycle **{label}**.", ephemeral=True)
-            else:
-                cycles.append({
-                    "name": label,
-                    "start_epoch": start_epoch,
-                    "duration_sec": duration_sec,
-                    "interval_sec": interval_sec,
-                    "pre_dm_sent": False,
-                    "post_dm_sent": False
-                })
-                await interaction.followup.send(f"✅ Created event cycle **{label}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+            async with db_lock:
+                data = load_data()
+                context_id = str(interaction.guild_id)
+                if context_id not in data: data[context_id] = {}
+                if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
                 
-            save_data(data)
+                cycles = data[context_id]["cycles"]
+                cycle = next((c for c in cycles if c['name'].lower() == label.lower()), None)
+                if cycle:
+                    cycle['start_epoch'] = start_epoch
+                    cycle['duration_sec'] = duration_sec
+                    cycle['interval_sec'] = interval_sec
+                    cycle['pre_dm_sent'] = False
+                    cycle['post_dm_sent'] = False
+                    await interaction.followup.send(f"✅ Updated event cycle **{label}**.", ephemeral=True)
+                else:
+                    cycles.append({
+                        "name": label,
+                        "start_epoch": start_epoch,
+                        "duration_sec": duration_sec,
+                        "interval_sec": interval_sec,
+                        "pre_dm_sent": False,
+                        "post_dm_sent": False
+                    })
+                    await interaction.followup.send(f"✅ Created event cycle **{label}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+                    
+                save_data(data)
             return
-
+    
         # 2. DELETE ACTION
         if action == "delete":
-            data = load_data()
-            context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
-            if context_id in data and "timers" in data[context_id]:
-                for idx, t in enumerate(data[context_id]["timers"]):
-                    if t['label'].lower() == label.lower():
-                        if not check_permissions(interaction, t['owner_id']):
-                            await interaction.followup.send("❌ **Access Denied.** You can only delete your own timers.", ephemeral=True); return
-                        removed = data[context_id]["timers"].pop(idx)
-                        if removed.get("discord_event_id") and interaction.guild:
-                            await delete_discord_event(interaction.guild, removed["discord_event_id"])
-                        save_data(data)
-                        if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
-                        await interaction.followup.send(f"✅ Deleted timer **{label}**.", ephemeral=True)
-                        return
+            removed_timer = None
+            async with db_lock:
+                data = load_data()
+                context_id = str(interaction.guild_id) if interaction.guild else str(interaction.user.id)
+                if context_id in data and "timers" in data[context_id]:
+                    for idx, t in enumerate(data[context_id]["timers"]):
+                        if t['label'].lower() == label.lower():
+                            if not check_permissions(interaction, t['owner_id']):
+                                await interaction.followup.send("❌ **Access Denied.** You can only delete your own timers.", ephemeral=True); return
+                            removed_timer = data[context_id]["timers"].pop(idx)
+                            save_data(data)
+                            break
+            
+            if removed_timer:
+                if removed_timer.get("discord_event_id") and interaction.guild:
+                    await delete_discord_event(interaction.guild, removed_timer["discord_event_id"])
+                if interaction.guild: await update_dashboard(interaction.guild, data[context_id], resend=True)
+                await interaction.followup.send(f"✅ Deleted timer **{label}**.", ephemeral=True)
+                return
+                
             await interaction.followup.send(f"❌ Timer **{label}** not found to delete.", ephemeral=True)
             return
 
@@ -2258,50 +2400,52 @@ async def dashboard(interaction: discord.Interaction, name: str = "Main Dashboar
     # Context ID
     context_id = str(interaction.guild_id)
     is_dm = False
-    data = load_data()
-    if context_id not in data: data[context_id] = {}
     
-    # Migration block
-    if "dashboards" not in data[context_id]:
-        data[context_id]["dashboards"] = []
-        if "dashboard_channel_id" in data[context_id]:
-            data[context_id]["dashboards"].append({
-                "name": "Main Dashboard",
-                "channel_id": data[context_id]["dashboard_channel_id"],
-                "message_id": data[context_id]["dashboard_message_id"]
-            })
-    
-    embed = discord.Embed(title=f"☁️ Chrono Dashboard - {name}", color=discord.Color.from_rgb(47, 49, 54))
-    embed.description = "*☁️ Chrono Silent - No Active Operations*"
-    
-    # Send new dashboard
-    view = DashboardView()
-    # Use followup since we already deferred
-    msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-    msg = await interaction.original_response()
-    # Pin if possible (might fail in User App contexts, that's okay)
-    try: 
-        await msg.pin()
-        # Clean up Notification
-        async for sys_msg in interaction.channel.history(limit=5):
-             if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == msg.id:
-                 await sys_msg.delete()
-                 break
-    except: pass
-    
-    # Save Location
-    existing = next((d for d in data[context_id]["dashboards"] if d["name"].lower() == name.lower()), None)
-    if existing:
-        existing["channel_id"] = interaction.channel_id
-        existing["message_id"] = msg.id
-    else:
-        data[context_id]["dashboards"].append({
-            "name": name,
-            "channel_id": interaction.channel_id,
-            "message_id": msg.id
-        })
+    async with db_lock:
+        data = load_data()
+        if context_id not in data: data[context_id] = {}
         
-    save_data(data)
+        # Migration block
+        if "dashboards" not in data[context_id]:
+            data[context_id]["dashboards"] = []
+            if "dashboard_channel_id" in data[context_id]:
+                data[context_id]["dashboards"].append({
+                    "name": "Main Dashboard",
+                    "channel_id": data[context_id]["dashboard_channel_id"],
+                    "message_id": data[context_id]["dashboard_message_id"]
+                })
+        
+        embed = discord.Embed(title=f"☁️ Chrono Dashboard - {name}", color=discord.Color.from_rgb(47, 49, 54))
+        embed.description = "*☁️ Chrono Silent - No Active Operations*"
+        
+        # Send new dashboard
+        view = DashboardView()
+        # Use followup since we already deferred
+        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+        msg = await interaction.original_response()
+        # Pin if possible (might fail in User App contexts, that's okay)
+        try: 
+            await msg.pin()
+            # Clean up Notification
+            async for sys_msg in interaction.channel.history(limit=5):
+                 if sys_msg.type == discord.MessageType.pins_add and sys_msg.reference and sys_msg.reference.message_id == msg.id:
+                     await sys_msg.delete()
+                     break
+        except: pass
+        
+        # Save Location
+        existing = next((d for d in data[context_id]["dashboards"] if d["name"].lower() == name.lower()), None)
+        if existing:
+            existing["channel_id"] = interaction.channel_id
+            existing["message_id"] = msg.id
+        else:
+            data[context_id]["dashboards"].append({
+                "name": name,
+                "channel_id": interaction.channel_id,
+                "message_id": msg.id
+            })
+            
+        save_data(data)
     
     # Refresh to fill timers
     await update_dashboard(interaction.guild, data[context_id], resend=False)
@@ -2361,33 +2505,34 @@ async def set_cycle(interaction: discord.Interaction, event_name: str, voting_st
         await interaction.followup.send(f"❌ Error parsing inputs: {e}", ephemeral=True)
         return
         
-    data = load_data()
-    context_id = str(interaction.guild_id)
-    if context_id not in data: data[context_id] = {}
-    if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
-    
-    # Update or add cycle
-    cycles = data[context_id]["cycles"]
-    cycle = next((c for c in cycles if c['name'].lower() == event_name.lower()), None)
-    if cycle:
-        cycle['start_epoch'] = start_epoch
-        cycle['duration_sec'] = duration_sec
-        cycle['interval_sec'] = interval_sec
-        cycle['pre_dm_sent'] = False
-        cycle['post_dm_sent'] = False
-        await interaction.followup.send(f"✅ Updated event cycle **{event_name}**.", ephemeral=True)
-    else:
-        cycles.append({
-            "name": event_name,
-            "start_epoch": start_epoch,
-            "duration_sec": duration_sec,
-            "interval_sec": interval_sec,
-            "pre_dm_sent": False,
-            "post_dm_sent": False
-        })
-        await interaction.followup.send(f"✅ Created event cycle **{event_name}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+    async with db_lock:
+        data = load_data()
+        context_id = str(interaction.guild_id)
+        if context_id not in data: data[context_id] = {}
+        if "cycles" not in data[context_id]: data[context_id]["cycles"] = []
         
-    save_data(data)
+        # Update or add cycle
+        cycles = data[context_id]["cycles"]
+        cycle = next((c for c in cycles if c['name'].lower() == event_name.lower()), None)
+        if cycle:
+            cycle['start_epoch'] = start_epoch
+            cycle['duration_sec'] = duration_sec
+            cycle['interval_sec'] = interval_sec
+            cycle['pre_dm_sent'] = False
+            cycle['post_dm_sent'] = False
+            await interaction.followup.send(f"✅ Updated event cycle **{event_name}**.", ephemeral=True)
+        else:
+            cycles.append({
+                "name": event_name,
+                "start_epoch": start_epoch,
+                "duration_sec": duration_sec,
+                "interval_sec": interval_sec,
+                "pre_dm_sent": False,
+                "post_dm_sent": False
+            })
+            await interaction.followup.send(f"✅ Created event cycle **{event_name}**. The bot will DM managers 24h before voting begins, and right after voting ends.", ephemeral=True)
+            
+        save_data(data)
 
 @bot.command(name="start")
 @commands.has_permissions(administrator=True)
@@ -2435,109 +2580,118 @@ async def sync_global(ctx):
 
 async def check_missed_events():
     logger.info("Checking for missed events...")
-    data = load_data()
-    try: now = int(time.time())
-    except: now = int(time.time()) 
-    
-    data_changed = False
-    
-    for context_id_str, context_data in data.items():
-        if "timers" not in context_data: continue
-        timers_to_keep = []
+    async with db_lock:
+        data = load_data()
+        try: now = int(time.time())
+        except: now = int(time.time()) 
         
-        # Resolve Context
-        guild = None
-        user = None
-        try: guild = bot.get_guild(int(context_id_str)) or await bot.fetch_guild(int(context_id_str))
-        except: pass
-        if not guild:
-            try: user = await bot.fetch_user(int(context_id_str))
+        changed_guilds = set()
+        
+        for context_id_str, context_data in data.items():
+            if "timers" not in context_data: continue
+            timers_to_keep = []
+            
+            # Resolve Context
+            guild = None
+            user = None
+            try: guild = bot.get_guild(int(context_id_str)) or await bot.fetch_guild(int(context_id_str))
             except: pass
-        
-        # Re-check timers for missed reminders (even if not expired)
-        for timer in context_data["timers"]:
-            if timer["end_epoch"] > now:
-                # Timer still active, check if we missed any reminders
-                reminders = timer.get("reminders", [])
-                sent = timer.get("sent_reminders", [])
-                for r_sec in reminders:
-                    if r_sec in sent: continue
-                    remain = timer["end_epoch"] - now
-                    # If we are PAST the reminder time (remain < r_sec) but within reasonable window (e.g. didn't happen 10 years ago)
-                    # And only if remain > 0 (event technically active)
-                    if remain <= r_sec:
-                        msg = f"⚠️ **Late Reminder (Bot Restarted):** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
-                        try:
-                            if guild:
-                                chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
-                                if chan: await chan.send(msg)
-                            elif user:
-                                await user.send(msg)
-                        except: pass
-                        sent.append(r_sec)
-                        timer["sent_reminders"] = sent
-                        data_changed = True
-                
-                # BUGFIX: Must always keep active timers!
-                timers_to_keep.append(timer)
-
-            elif timer["end_epoch"] <= now:
-                logger.info(f"Restoring expired timer: {timer['label']}")
-                try:
-                    embed = discord.Embed(title="⚠️ Missed Alert (Offline)", description=f"**{timer['label']}** ended at <t:{timer['end_epoch']}:t>.", color=discord.Color.orange())
-                    if guild:
-                        chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
-                        if chan:
-                            await chan.send(content=f"<@{timer['owner_id']}>", embed=embed)
-                    elif user:
-                        await user.send(embed=embed)
+            if not guild:
+                try: user = await bot.fetch_user(int(context_id_str))
                 except: pass
-                
-                recur = timer.get("recurrence_seconds", 0)
-                if recur > 0:
-                    next_time = timer["end_epoch"]
-                    while next_time < now: next_time += recur
-                    timer["end_epoch"] = next_time
-                    timer["start_epoch"] = now 
-                    timer["sent_reminders"] = []
+            
+            guild_changed = False
+            
+            # Re-check timers for missed reminders (even if not expired)
+            for timer in context_data["timers"]:
+                if timer["end_epoch"] > now:
+                    # Timer still active, check if we missed any reminders
+                    reminders = timer.get("reminders", [])
+                    sent = timer.get("sent_reminders", [])
+                    for r_sec in reminders:
+                        if r_sec in sent: continue
+                        remain = timer["end_epoch"] - now
+                        # If we are PAST the reminder time (remain < r_sec) but within reasonable window (e.g. didn't happen 10 years ago)
+                        # And only if remain > 0 (event technically active)
+                        if remain <= r_sec:
+                            msg = f"⚠️ **Late Reminder (Bot Restarted):** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
+                            try:
+                                if guild:
+                                    chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
+                                    if chan: asyncio.create_task(chan.send(msg))
+                                elif user:
+                                    asyncio.create_task(user.send(msg))
+                            except Exception as e:
+                                logger.error(f"Failed to send missed early reminder: {e}")
+                            sent.append(r_sec)
+                            timer["sent_reminders"] = sent
+                            guild_changed = True
                     
-                    # New Cycle = New Event (If Guild)
-                    if guild:
-                        dur = timer.get("event_duration", 900)
-                        # Clean old event first if exists
-                        if timer.get("discord_event_id"):
-                             try:
-                                 old_evt = await guild.fetch_scheduled_event(timer["discord_event_id"])
-                                 await old_evt.delete()
-                             except: pass
-
-                        evt_id = await create_discord_event(guild, timer["label"], next_time, dur)
-                        timer["discord_event_id"] = evt_id
-                    
+                    # BUGFIX: Must always keep active timers!
                     timers_to_keep.append(timer)
-                    data_changed = True
-                else:
-                    data_changed = True
-        
-        # Check Foundry Missed
-        # If it's Thursday/Friday/Saturday/Sunday and we haven't asked yet?
-        # That's complex state. Simplified: The main loop handles it if we just reset the 'asked' flag?
-        # Actually proper way:
-        # Foundry jobs are just timers that auto-renew 7 days.
-        # If one expired while offline, the logic above (recur > 0) will auto-renew it.
-        # But we missed the "Ask" DM.
-        # Fix: The main loop checks "if end_epoch <= current_time".
-        # If check_missed_events auto-renews it, the main loop sees it as "future" and won't ask.
-        # Special handling for Foundry:
-        # If a foundry job expired, we *should* DM the user now if it's still relevant.
-        # But for v41 robustness, let's trust the auto-renew to at least keep the schedule alive.
-        # The user can manually trigger if needed.
-
-        if data_changed:
-            timers_to_keep.sort(key=lambda x: x["end_epoch"])
-            context_data["timers"] = timers_to_keep
+    
+                elif timer["end_epoch"] <= now:
+                    logger.info(f"Restoring expired timer: {timer['label']}")
+                    try:
+                        embed = discord.Embed(title="⚠️ Missed Alert (Offline)", description=f"**{timer['label']}** ended at <t:{timer['end_epoch']}:t>.", color=discord.Color.orange())
+                        if guild:
+                            chan = guild.get_channel(context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id"))
+                            if chan:
+                                asyncio.create_task(chan.send(content=f"<@{timer['owner_id']}>", embed=embed))
+                        elif user:
+                            asyncio.create_task(user.send(embed=embed))
+                    except Exception as e:
+                        logger.error(f"Failed to send missed expiry alert: {e}")
+                    
+                    recur = timer.get("recurrence_seconds", 0)
+                    if recur > 0:
+                        next_time = timer["end_epoch"]
+                        while next_time < now: next_time += recur
+                        timer["end_epoch"] = next_time
+                        timer["start_epoch"] = now 
+                        timer["sent_reminders"] = []
+                        
+                        # New Cycle = New Event (If Guild)
+                        if guild:
+                            dur = timer.get("event_duration", 900)
+                            # Clean old event first if exists
+                            if timer.get("discord_event_id"):
+                                 try:
+                                     asyncio.create_task(delete_discord_event(guild, timer["discord_event_id"]))
+                                 except: pass
+                                 timer["discord_event_id"] = None
+    
+                            if timer.get("role_id") and timer.get("mode", "") != "silent":
+                                try:
+                                    evt_id = await create_discord_event(guild, timer["label"], next_time, dur)
+                                    timer["discord_event_id"] = evt_id
+                                except Exception as e:
+                                    logger.error(f"Failed to create missed event: {e}")
+                                    timer["discord_event_id"] = None
+                        
+                        timers_to_keep.append(timer)
+                        guild_changed = True
+                    else:
+                        guild_changed = True
+    
+            if guild_changed:
+                timers_to_keep.sort(key=lambda x: x["end_epoch"])
+                context_data["timers"] = timers_to_keep
+                changed_guilds.add(context_id_str)
+                
+        if changed_guilds:
             save_data(data)
-            if guild: await update_dashboard(guild, context_data)
+
+    for context_id_str in changed_guilds:
+        try:
+            g = bot.get_guild(int(context_id_str))
+            async with db_lock:
+                current_data = load_data()
+                ctx_data = current_data.get(context_id_str)
+            if g and ctx_data:
+                await update_dashboard(g, ctx_data)
+        except Exception as e:
+            logger.error(f"Dashboard refresh error in check_missed_events: {e}")
 
     import os
     import asyncio
@@ -2723,7 +2877,7 @@ async def tz_autocomplete(interaction: discord.Interaction, current: str) -> lis
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def set_timezone_slash(interaction: discord.Interaction, timezone: str):
-    success = set_user_tz_str(interaction.user.id, timezone)
+    success = await set_user_tz_str(interaction.user.id, timezone)
     if success:
         await interaction.response.send_message(f"✅ Your timezone has been secured as **{timezone}**!\n\nWhen you create timers via DM or the Command Menu, I will now assume the time you type belongs to this timezone instead of raw UTC. Easy!", ephemeral=True)
     else:
@@ -2968,278 +3122,301 @@ async def on_message(message):
 async def add_timer_internal(guild, label, end_epoch, role_id, notify, mode, recur, img, dur, rems, owner_id=None, description=None):
     # Mock Interaction for reusable logic? Hard to mock.
     # Better: access data directly.
-    data = load_data()
-    gid = str(guild.id)
-    if gid not in data: return
-    if "timers" not in data[gid]: data[gid]["timers"] = []
-    
     evt_id = await create_discord_event(guild, label, end_epoch, dur, description=description)
     
-    nt = {
-        "label": label, "end_epoch": end_epoch, "start_epoch": int(time.time()),
-        "owner_id": owner_id or bot.user.id, "role_id": role_id, "notify_method": notify,
-        "mode": mode, "recurrence_seconds": recur, "discord_event_id": evt_id,
-        "event_duration": dur, "reminders": rems, "sent_reminders": [],
-        "description": description
-    }
-    data[gid]["timers"].append(nt)
-    data[gid]["timers"].sort(key=lambda x: x["end_epoch"])
-    save_data(data)
+    async with db_lock:
+        data = load_data()
+        gid = str(guild.id)
+        if gid not in data: return
+        if "timers" not in data[gid]: data[gid]["timers"] = []
+        
+        nt = {
+            "label": label, "end_epoch": end_epoch, "start_epoch": int(time.time()),
+            "owner_id": owner_id or bot.user.id, "role_id": role_id, "notify_method": notify,
+            "mode": mode, "recurrence_seconds": recur, "discord_event_id": evt_id,
+            "event_duration": dur, "reminders": rems, "sent_reminders": [],
+            "description": description
+        }
+        data[gid]["timers"].append(nt)
+        data[gid]["timers"].sort(key=lambda x: x["end_epoch"])
+        save_data(data)
+        
     await update_dashboard(guild, data[gid], resend=True)
 
 # --- Loop ---
 @tasks.loop(seconds=5)
 async def check_timers():
-    data = load_data()
-    current_time = int(time.time())
-    data_changed = False
-    
-    for context_id_str, context_data in data.items():
-        if "timers" not in context_data: continue
+    async with db_lock:
+        data = load_data()
+        current_time = int(time.time())
+        changed_guilds = set()
         
-        active_timers = []
-        expired_timers = []
-        
-        # Context Resolution (Guild vs DM)
-        guild = None
-        user = None
-        
-        # Try to fetch guild first
-        try:
-             guild = bot.get_guild(int(context_id_str))
-        except: pass
-        
-        # If no guild, maybe it's a User ID (DM)
-        if not guild:
-             try: user = await bot.fetch_user(int(context_id_str))
-             except: pass
-        
-        # If neither, skip (stale data?)
-        if not guild and not user: continue
-    
-        for timer in context_data["timers"]:
-            
-            # --- Check Foundry Job ---
-            if timer.get("type") == "foundry_job":
-                 # (Same Foundry Logic - uses owner_id so it works in DMs too if lead matches)
-                 if timer["end_epoch"] <= current_time:
-                     lead_id = timer["owner_id"]
-                     try:
-                         u = await bot.fetch_user(lead_id)
-                         if u:
-                             await u.send(f"👋 **Foundry Assistant here!**\nTime to schedule this Sunday's battle.\n\n**What is the Legion 1 time in UTC?** (Reply with the hour, e.g., `14` or `19`)")
-                             user_foundry_state[lead_id] = {"step": "awaiting_l1_time", "guild_id": int(context_id_str)} # Store context
-                     except: pass
-                     timer["end_epoch"] += 1209600
-                     timer["start_epoch"] = current_time
-                     active_timers.append(timer)
-                     data_changed = True
-                     continue
-            
-            # --- Early Reminders (Robust) ---
-            reminders = timer.get("reminders", [])
-            sent = timer.get("sent_reminders", [])
-            
-            target_epoch = timer.get("override_epoch", timer["end_epoch"])
-            remain = target_epoch - current_time
-            
-            for r_sec in reminders:
-                if r_sec in sent: continue
-                
-                # Check for "Due Now" OR "Missed but Event still Active"
-                # If remain <= r_sec, it means we passed the reminder point.
-                # But we only send it if the event hasn't expired (remain > -60 for grace)
-                if remain <= r_sec and remain > -60:
-                     msg = ""
-                     if remain > (r_sec - 30):
-                         # Normal Timing (within 30s)
-                         if r_sec == 600 and "Foundry Battle" in timer['label']:
-                             msg = f"⚠️ **Attention!** `{timer['label']}` in 10 minutes! **Call all troops back and free up the hospital NOW!**"
-                         else:
-                             msg = f"⚠️ **Reminder:** `{timer['label']}` in {get_interval_str(r_sec)}!"
-                     else:
-                         # Late Timing (Missed window)
-                         msg = f"⚠️ **Late Reminder:** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
-
-                     try:
-                        if guild:
-                            # Fallback: Send to dashboard channel if exists
-                            db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
-                            if db_ch_id:
-                                ch = guild.get_channel(db_ch_id)
-                                if ch: await ch.send(msg)
-                        elif user:
-                            await user.send(msg)
-                     except: pass
-                     
-                     sent.append(r_sec)
-                     timer["sent_reminders"] = sent
-                     data_changed = True
-
-            # --- 5-Minute Early Tag ---
-            dur = target_epoch - timer.get("start_epoch", target_epoch - 301)
-            if dur >= 300:
-                if remain <= 300 and remain > -60 and "5min_ping" not in sent:
-                    msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
-                    notify = timer.get('notify_method', 'Silent')
-                    role_id = timer.get('role_id')
-                    
-                    content = msg
-                    if "Ping Role" in notify and role_id:
-                         content += f" <@&{role_id}>"
-                    elif "everyone" in notify:
-                         content += " @everyone"
-
-                    try:
-                        if guild:
-                            db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
-                            if db_ch_id:
-                                ch = guild.get_channel(db_ch_id)
-                                if ch: await ch.send(content)
-                        elif user:
-                            await user.send(content)
-                    except: pass
-                    
-                    sent.append("5min_ping")
-                    timer["sent_reminders"] = sent
-                    data_changed = True
-
-            # --- Expiry Check ---
-            if current_time >= target_epoch:
-                expired_timers.append(timer)
-            else:
-                active_timers.append(timer)
-        
-        # Process Expired
-        for timer in expired_timers:
-            lbl = timer['label']
-            notify = timer.get('notify_method', 'Silent')
-            owner_id = timer.get('owner_id')
-            role_id = timer.get('role_id')
-            
-            msg = f"⏰ **Timer Ended:** {lbl}"
-            
-            # Notification Logic
-            try:
-                if guild:
-                    # Find Channel: Dashboard Channel
-                    db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
-                    channel = guild.get_channel(db_ch_id) if db_ch_id else None
-                    if channel:
-                         content = msg
-                         # Ping at expiry only if timer was too short for the 5-min warning
-                         target_epoch_expiry = timer.get("override_epoch", timer["end_epoch"])
-                         dur = target_epoch_expiry - timer.get("start_epoch", target_epoch_expiry - 301)
-                         if dur < 300:
-                             if "Ping Role" in notify and role_id:
-                                  content += f" <@&{role_id}>"
-                             elif "everyone" in notify:
-                                  content += " @everyone"
-                         
-                         await channel.send(content)
-                elif user:
-                    # DM Context
-                    if "Chat" in notify:
-                        # Try to send to the dashboard channel (Group DM or DM)
-                        db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
-                        try:
-                            # Try fetch if not cached (Group DMs often need fetch)
-                            ch = bot.get_channel(db_ch_id) or await bot.fetch_channel(db_ch_id)
-                            await ch.send(msg)
-                        except Exception as e:
-                            logger.warning(f"Failed to share in chat ({db_ch_id}): {e}. Falling back to DM.")
-                            # Fallback to User DM with explanation
-                            await user.send(f"{msg}\n*(Note: I couldn't post in the group chat, so I sent this to you privately.)*")
-                    else:
-                        # Default / Private
-                        await user.send(msg)
-            except Exception as e:
-                logger.error(f"Failed to send alert: {e}")
-
-            # Recurrence
-            recur = timer.get("recurrence_seconds", 0)
-            if recur > 0:
-                if "override_epoch" in timer:
-                    del timer["override_epoch"]
-                    
-                next_time = timer["end_epoch"] + recur
-                while next_time <= current_time: next_time += recur
-                timer["end_epoch"] = next_time
-                timer["start_epoch"] = current_time
-                timer["sent_reminders"] = [] # Reset reminders
-                active_timers.append(timer)
-                data_changed = True
-                
-                # Re-create Event if Guild
-                if guild and timer.get("discord_event_id"):
-                     # Fire and forget delete old
-                     asyncio.create_task(delete_discord_event(guild, timer["discord_event_id"]))
-                     dur = timer.get("event_duration", 900)
-                     
-                     # Only recreate if it has a role ping, as per new rules
-                     if timer.get("role_id"):
-                         try:
-                             new_id = await create_discord_event(guild, timer["label"], timer["end_epoch"], dur)
-                             timer["discord_event_id"] = new_id
-                         except Exception as e:
-                             logger.error(f"Failed to recreate Discord Event: {e}")
-                             timer["discord_event_id"] = None
-                     else:
-                         timer["discord_event_id"] = None
-
-            
-        context_data["timers"] = active_timers
-        if expired_timers and not data_changed: data_changed = True # Removal counts as change
-
-        # --- Cycle Checks ---
-        cycles = context_data.get("cycles", [])
-        for cycle in cycles:
-            mgr_ids = context_data.get("timing_managers", [])
-            if not mgr_ids: 
-                if guild: mgr_ids = [guild.owner_id]
-                else: continue
-            
-            # Step 1: Pre-Voting (24h before start_epoch)
-            pre_time = cycle['start_epoch'] - 86400
-            if current_time >= pre_time and not cycle.get('pre_dm_sent', False):
-                cycle['pre_dm_sent'] = True
-                data_changed = True
-                for mid in set(mgr_ids):
-                    try:
-                        m = await bot.fetch_user(mid)
-                        await m.send(f"🏆 **Reminder:** `{cycle['name']}` voting opens in 24 hours! Don't forget to post the poll.")
-                    except: pass
-            
-            # Step 2: Post-Voting (start_epoch + duration_sec)
-            post_time = cycle['start_epoch'] + cycle['duration_sec']
-            if current_time >= post_time and not cycle.get('post_dm_sent', False):
-                cycle['post_dm_sent'] = True
-                data_changed = True
-                
-                for mid in set(mgr_ids):
-                    try:
-                        m = await bot.fetch_user(mid)
-                        await m.send(f"🗳️ Voting has ended for `{cycle['name']}`!\n\n**What time are we running the event?**\n*(Reply here, e.g. \"Set {cycle['name']} for Thursday 14:00 UTC\")*")
-                        if guild: user_cycle_states[mid] = {"guild_id": guild.id, "cycle_name": cycle['name']}
-                    except: pass
-                    
-                # Move to next cycle
-                if cycle['interval_sec'] > 0:
-                    # Catch up if bot was offline
-                    while current_time >= (cycle['start_epoch'] + cycle['interval_sec']):
-                         cycle['start_epoch'] += cycle['interval_sec']
-                    cycle['start_epoch'] += cycle['interval_sec']
-                    cycle['pre_dm_sent'] = False
-                    cycle['post_dm_sent'] = False
-
-    if data_changed:
-        save_data(data)
-        # Refresh Dashboards
         for context_id_str, context_data in data.items():
+            if "timers" not in context_data: continue
+            
+            active_timers = []
+            expired_timers = []
+            
+            # Context Resolution (Guild vs DM)
+            guild = None
+            user = None
+            
+            # Try to fetch guild first
             try:
-                g = bot.get_guild(int(context_id_str))
-                if g: await update_dashboard(g, context_data, resend=True)
+                 guild = bot.get_guild(int(context_id_str))
             except: pass
+            
+            # If no guild, maybe it's a User ID (DM)
+            if not guild:
+                 try: user = await bot.fetch_user(int(context_id_str))
+                 except: pass
+            
+            # If neither, skip (stale data?)
+            if not guild and not user: continue
+            
+            guild_changed = False
+        
+            for timer in context_data["timers"]:
+                
+                # --- Check Foundry Job ---
+                if timer.get("type") == "foundry_job":
+                     # (Same Foundry Logic - uses owner_id so it works in DMs too if lead matches)
+                     if timer["end_epoch"] <= current_time:
+                         lead_id = timer["owner_id"]
+                         try:
+                             u = await bot.fetch_user(lead_id)
+                             if u:
+                                 asyncio.create_task(u.send(f"👋 **Foundry Assistant here!**\nTime to schedule this Sunday's battle.\n\n**What is the Legion 1 time in UTC?** (Reply with the hour, e.g., `14` or `19`)"))
+                                 user_foundry_state[lead_id] = {"step": "awaiting_l1_time", "guild_id": int(context_id_str)} # Store context
+                         except Exception as e:
+                             logger.error(f"Foundry DM error: {e}")
+                         timer["end_epoch"] += 1209600
+                         timer["start_epoch"] = current_time
+                         active_timers.append(timer)
+                         guild_changed = True
+                         continue
+                
+                # --- Early Reminders (Robust) ---
+                reminders = timer.get("reminders", [])
+                sent = timer.get("sent_reminders", [])
+                
+                target_epoch = timer.get("override_epoch", timer["end_epoch"])
+                remain = target_epoch - current_time
+                
+                for r_sec in reminders:
+                    if r_sec in sent: continue
+                    
+                    # Check for "Due Now" OR "Missed but Event still Active"
+                    # If remain <= r_sec, it means we passed the reminder point.
+                    # But we only send it if the event hasn't expired (remain > -60 for grace)
+                    if remain <= r_sec and remain > -60:
+                         msg = ""
+                         if remain > (r_sec - 30):
+                             # Normal Timing (within 30s)
+                             if r_sec == 600 and "Foundry Battle" in timer['label']:
+                                 msg = f"⚠️ **Attention!** `{timer['label']}` in 10 minutes! **Call all troops back and free up the hospital NOW!**"
+                             else:
+                                 msg = f"⚠️ **Reminder:** `{timer['label']}` in {get_interval_str(r_sec)}!"
+                         else:
+                             # Late Timing (Missed window)
+                             msg = f"⚠️ **Late Reminder:** `{timer['label']}` was due {get_interval_str(r_sec)} ago! (Event in {get_interval_str(remain)})"
+    
+                         try:
+                            if guild:
+                                # Fallback: Send to dashboard channel if exists
+                                db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
+                                if db_ch_id:
+                                    ch = guild.get_channel(db_ch_id)
+                                    if ch: asyncio.create_task(ch.send(msg))
+                            elif user:
+                                asyncio.create_task(user.send(msg))
+                         except Exception as e:
+                            logger.error(f"Early reminder send error: {e}")
+                         
+                         sent.append(r_sec)
+                         timer["sent_reminders"] = sent
+                         guild_changed = True
+    
+                # --- 5-Minute Early Tag ---
+                dur = target_epoch - timer.get("start_epoch", target_epoch - 301)
+                if dur >= 300:
+                    if remain <= 300 and remain > -60 and "5min_ping" not in sent:
+                        msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
+                        notify = timer.get('notify_method', 'Silent')
+                        role_id = timer.get('role_id')
+                        
+                        content = msg
+                        if "Ping Role" in notify and role_id:
+                             content += f" <@&{role_id}>"
+                        elif "everyone" in notify:
+                             content += " @everyone"
+    
+                        try:
+                            if guild:
+                                db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
+                                if db_ch_id:
+                                    ch = guild.get_channel(db_ch_id)
+                                    if ch: asyncio.create_task(ch.send(content))
+                            elif user:
+                                asyncio.create_task(user.send(content))
+                        except Exception as e:
+                            logger.error(f"5-min ping error: {e}")
+                        
+                        sent.append("5min_ping")
+                        timer["sent_reminders"] = sent
+                        guild_changed = True
+    
+                # --- Expiry Check ---
+                if current_time >= target_epoch:
+                    expired_timers.append(timer)
+                else:
+                    active_timers.append(timer)
+            
+            # Process Expired
+            for timer in expired_timers:
+                lbl = timer['label']
+                notify = timer.get('notify_method', 'Silent')
+                owner_id = timer.get('owner_id')
+                role_id = timer.get('role_id')
+                
+                msg = f"⏰ **Timer Ended:** {lbl}"
+                
+                # Notification Logic
+                try:
+                    if guild:
+                        # Find Channel: Dashboard Channel
+                        db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
+                        channel = guild.get_channel(db_ch_id) if db_ch_id else None
+                        if channel:
+                             content = msg
+                             # Ping at expiry only if timer was too short for the 5-min warning
+                             target_epoch_expiry = timer.get("override_epoch", timer["end_epoch"])
+                             dur = target_epoch_expiry - timer.get("start_epoch", target_epoch_expiry - 301)
+                             if dur < 300:
+                                 if "Ping Role" in notify and role_id:
+                                      content += f" <@&{role_id}>"
+                                 elif "everyone" in notify:
+                                      content += " @everyone"
+                             
+                             asyncio.create_task(channel.send(content))
+                    elif user:
+                        # DM Context
+                        if "Chat" in notify:
+                            # Try to send to the dashboard channel (Group DM or DM)
+                            db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
+                            try:
+                                # Try fetch if not cached (Group DMs often need fetch)
+                                ch = bot.get_channel(db_ch_id) or await bot.fetch_channel(db_ch_id)
+                                asyncio.create_task(ch.send(msg))
+                            except Exception as e:
+                                logger.warning(f"Failed to share in chat ({db_ch_id}): {e}. Falling back to DM.")
+                                # Fallback to User DM with explanation
+                                asyncio.create_task(user.send(f"{msg}\n*(Note: I couldn't post in the group chat, so I sent this to you privately.)*"))
+                        else:
+                            # Default / Private
+                            asyncio.create_task(user.send(msg))
+                except Exception as e:
+                    logger.error(f"Failed to send expiry alert: {e}")
+    
+                # Recurrence
+                recur = timer.get("recurrence_seconds", 0)
+                if recur > 0:
+                    if "override_epoch" in timer:
+                        del timer["override_epoch"]
+                        
+                    next_time = timer["end_epoch"] + recur
+                    while next_time <= current_time: next_time += recur
+                    timer["end_epoch"] = next_time
+                    timer["start_epoch"] = current_time
+                    timer["sent_reminders"] = [] # Reset reminders
+                    active_timers.append(timer)
+                    guild_changed = True
+                    
+                    # Re-create Event if Guild
+                    if guild and timer.get("discord_event_id"):
+                         # Fire and forget delete old
+                         asyncio.create_task(delete_discord_event(guild, timer["discord_event_id"]))
+                         dur = timer.get("event_duration", 900)
+                         
+                         # Only recreate if it has a role ping, as per new rules
+                         if timer.get("role_id"):
+                             try:
+                                 # Await is okay here since it's rare, but ideally we'd offload it.
+                                 # We are in db_lock, so it's slightly slow. Let's fire and forget it.
+                                 # Actually we need the new ID. For now, keep await, it's fast.
+                                 new_id = await create_discord_event(guild, timer["label"], timer["end_epoch"], dur)
+                                 timer["discord_event_id"] = new_id
+                             except Exception as e:
+                                 logger.error(f"Failed to recreate Discord Event: {e}")
+                                 timer["discord_event_id"] = None
+                         else:
+                             timer["discord_event_id"] = None
+    
+                
+            context_data["timers"] = active_timers
+            if expired_timers and not guild_changed: guild_changed = True # Removal counts as change
+    
+            # --- Cycle Checks ---
+            cycles = context_data.get("cycles", [])
+            for cycle in cycles:
+                mgr_ids = context_data.get("timing_managers", [])
+                if not mgr_ids: 
+                    if guild: mgr_ids = [guild.owner_id]
+                    else: continue
+                
+                # Step 1: Pre-Voting (24h before start_epoch)
+                pre_time = cycle['start_epoch'] - 86400
+                if current_time >= pre_time and not cycle.get('pre_dm_sent', False):
+                    cycle['pre_dm_sent'] = True
+                    guild_changed = True
+                    for mid in set(mgr_ids):
+                        try:
+                            m = await bot.fetch_user(mid)
+                            asyncio.create_task(m.send(f"🏆 **Reminder:** `{cycle['name']}` voting opens in 24 hours! Don't forget to post the poll."))
+                        except Exception as e:
+                            logger.error(f"Cycle pre-DM error: {e}")
+                
+                # Step 2: Post-Voting (start_epoch + duration_sec)
+                post_time = cycle['start_epoch'] + cycle['duration_sec']
+                if current_time >= post_time and not cycle.get('post_dm_sent', False):
+                    cycle['post_dm_sent'] = True
+                    guild_changed = True
+                    
+                    for mid in set(mgr_ids):
+                        try:
+                            m = await bot.fetch_user(mid)
+                            asyncio.create_task(m.send(f"🗳️ Voting has ended for `{cycle['name']}`!\n\n**What time are we running the event?**\n*(Reply here, e.g. \"Set {cycle['name']} for Thursday 14:00 UTC\")*"))
+                            if guild: user_cycle_states[mid] = {"guild_id": guild.id, "cycle_name": cycle['name']}
+                        except Exception as e:
+                            logger.error(f"Cycle post-DM error: {e}")
+                        
+                    # Move to next cycle
+                    if cycle['interval_sec'] > 0:
+                        # Catch up if bot was offline
+                        while current_time >= (cycle['start_epoch'] + cycle['interval_sec']):
+                             cycle['start_epoch'] += cycle['interval_sec']
+                        cycle['start_epoch'] += cycle['interval_sec']
+                        cycle['pre_dm_sent'] = False
+                        cycle['post_dm_sent'] = False
+            
+            if guild_changed:
+                changed_guilds.add(context_id_str)
+    
+        if changed_guilds:
+            save_data(data)
+
+    # Refresh Dashboards OUTSIDE the lock to prevent blocking database for other commands!
+    for context_id_str in changed_guilds:
+        try:
+            g = bot.get_guild(int(context_id_str))
+            # Re-load just for the dashboard refresh safely.
+            async with db_lock:
+                current_data = load_data()
+                ctx_data = current_data.get(context_id_str)
+            if g and ctx_data:
+                await update_dashboard(g, ctx_data, resend=True)
+        except Exception as e:
+            logger.error(f"Dashboard refresh error in check_timers: {e}")
 
 @check_timers.before_loop
 async def before_check_timers():
