@@ -2101,7 +2101,7 @@ async def parse_natural_language_groq(text: str) -> dict:
       "action": "create", // or "edit", "override", "delete", "add_manager", "remove_manager", "set_cycle"
       "label": "The name of the event (use standard game emojis if matching defaults, but ALWAYS preserve any extra numbers/words the user added, e.g., 'Bear Trap 2' -> '🐻 Bear Trap 2'). If the user does not specify a title, intelligently infer an appropriate one (e.g. 'General Reminder').",
       "description": "A brief description of the event. Extract extra context from the user's prompt if provided. If not provided, intelligently generate a short, fun, and appropriate description for the event.",
-      "time_string": "The extracted time. You MUST convert all natural/foreign times (e.g. 'halb drei', '3 PM') into strict 24-hour formats ('14:30', '15:00', 'YYYY-MM-DD HH:MM') or durations ('2h 30m'). DO NOT include timezone names.",
+      "time_string": "The extracted time. You MUST convert 12-hour AM/PM times into 24-hour formats (e.g. '3 PM' -> '15:00'), but ALWAYS preserve any dates or relative days (e.g. 'tomorrow at 15:00', 'Friday 15:00'). DO NOT include timezone names.",
       "timezone": "The explicitly stated timezone (e.g., 'EST', 'CET'). Leave empty if none is mentioned.",
       "duration_string": "Only used for set_cycle (e.g. '24h', '48h'). Empty otherwise.",
       "interval_string": "The extracted repeat interval (e.g., '24h'). Use '0' if it doesn't repeat.",
@@ -2126,7 +2126,9 @@ async def parse_natural_language_groq(text: str) -> dict:
     Output: {{"action": "add_manager", "label": "", "description": "", "time_string": "", "timezone": "", "duration_string": "", "interval_string": "0", "reminders_string": "", "target_role": "John", "notify_method": "channel"}}
 
     Example 5: "I have foundry on this friday voting starts on tuesday and ends on wednesday. repeats every 2 weeks."
-    Output: {{"action": "set_cycle", "label": "Foundry", "description": "Foundry event cycle.", "time_string": "Tuesday", "timezone": "", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}    Example 6: "Upcoming Bear Trap will be tomorrow 18:00 UTC but rest normal"
+    Output: {{"action": "set_cycle", "label": "Foundry", "description": "Foundry event cycle.", "time_string": "Tuesday", "timezone": "", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
+    
+    Example 6: "Upcoming Bear Trap will be tomorrow 18:00 UTC but rest normal"
     Output: {{"action": "override", "label": "🐻 Bear Trap", "description": "", "time_string": "tomorrow 18:00", "timezone": "UTC", "duration_string": "", "interval_string": "", "reminders_string": "", "target_role": "", "notify_method": ""}}
     
     9. "Now" Handling: DO NOT output "now" for time_string if the user gives a duration (like "for the next 5 minutes"). In that case, time_string should be "5m".
