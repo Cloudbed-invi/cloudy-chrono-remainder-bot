@@ -198,8 +198,12 @@ class StratusBot(commands.Bot):
         
         # Force Sync Slash Commands
         logger.info("Forcing Command Tree Sync...")
-        await self.tree.sync()
-        logger.info("Command Tree Synced!")
+        try:
+            await self.tree.sync()
+            self.commands_synced = True
+            logger.info("Command Tree Synced!")
+        except Exception as e:
+            logger.error(f"Failed to sync command tree: {e}")
 
 bot = StratusBot()
 
