@@ -2114,7 +2114,7 @@ async def parse_natural_language_groq(text: str, user_tz_str: str = "UTC") -> di
       "description": "A brief description of the event. Extract extra context from the user's prompt if provided. If not provided, intelligently generate a short, fun, and appropriate description for the event.",
       "time_string": "The EXACT target date and time calculated from the user's request and the Current Date. You MUST format this STRICTLY as 'YYYY-MM-DD HH:MM' or a duration like '5m', '2h'. Example: '2026-06-25 15:00'. DO NOT output natural language dates.",
       "timezone": "The explicitly stated timezone (e.g., 'EST', 'CET'). Leave empty if none is mentioned.",
-      "duration_string": "Only used for set_cycle (e.g. '24h', '48h'). Empty otherwise.",
+      "duration_string": "The duration of the event if specified (e.g. '24h', '30m'). For set_cycle, this is how long the active phase lasts.",
       "interval_string": "The extracted repeat interval (e.g., '24h'). Use '0' if it doesn't repeat.",
       "reminders_string": "Any early reminders mentioned (e.g., '10m, 5m').",
       "target_role": "The name of the role they want to ping, or the name of the user to add to managers. Leave empty if not specified.",
@@ -2318,6 +2318,12 @@ async def remind_slash(interaction: discord.Interaction, request: str):
         if reminders_str:
             reminders_list = parse_reminders_string(str(reminders_str))
             
+        event_duration = None
+        duration_str = parsed.get("duration_string", "")
+        if duration_str and str(duration_str) != "0":
+            try: event_duration = parse_duration_string(str(duration_str))
+            except: pass
+            
         # Role & Notification Extraction
         target_role_str = parsed.get("target_role", "")
         role_id = None
@@ -2418,7 +2424,7 @@ async def remind_slash(interaction: discord.Interaction, request: str):
             await interaction.followup.send(f"❌ Recurring timer **{label}** not found.", ephemeral=True)
             return
 
-        await add_timer(interaction, label, end_epoch, role_id, notify_method or "📢 Message in Server (Ping Role)", "smart", recurrence_seconds or 0, None, 900, reminders_list or [], description)
+        await add_timer(interaction, label, end_epoch, role_id, notify_method or "📢 Message in Server (Ping Role)", "smart", recurrence_seconds or 0, None, event_duration or 900, reminders_list or [], description)
         
     except ValueError as e:
         await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
@@ -3021,12 +3027,18 @@ async def on_message(message):
                 if reminders_str:
                     reminders_list = parse_reminders_string(reminders_str)
                     
+                event_duration = 900
+                duration_str = parsed.get("duration_string", "")
+                if duration_str and str(duration_str) != "0":
+                    try: event_duration = parse_duration_string(str(duration_str))
+                    except: pass
+                    
                 label = parsed.get("label", "Reminder")
                 notify_method = "📢 Message in Server (Ping Role)" if message.guild else "📩 DM Me"
                 
                 owner_id = message.author.id
                 
-                await add_timer_internal(message.guild, label, end_epoch, None, notify_method, "smart", recurrence_seconds, None, 900, reminders_list, owner_id=owner_id)
+                await add_timer_internal(message.guild, label, end_epoch, None, notify_method, "smart", recurrence_seconds, None, event_duration, reminders_list, owner_id=owner_id)
                 
                 ts = int(end_epoch)
                 embed = discord.Embed(title="✅ Timer Set (NLP)", color=discord.Color.green())
