@@ -2130,6 +2130,7 @@ async def parse_natural_language_groq(text: str) -> dict:
     Output: {{"action": "override", "label": "🐻 Bear Trap", "description": "", "time_string": "tomorrow 18:00", "timezone": "UTC", "duration_string": "", "interval_string": "", "reminders_string": "", "target_role": "", "notify_method": ""}}
     
     9. "Now" Handling: DO NOT output "now" for time_string if the user gives a duration (like "for the next 5 minutes"). In that case, time_string should be "5m".
+    10. Countdown / Repeated Tags: If the user says "tag me every minute for the next 5 minutes", set time_string="5m", interval_string="0", and generate the countdown reminders yourself in reminders_string (e.g. "4m, 3m, 2m, 1m").
     """
     
     try:
