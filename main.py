@@ -3302,34 +3302,7 @@ async def check_timers():
                          timer["sent_reminders"] = sent
                          guild_changed = True
     
-                # --- 5-Minute Early Tag ---
-                dur = target_epoch - timer.get("start_epoch", target_epoch - 301)
-                if dur > 300:
-                    if remain <= 300 and remain > -60 and "5min_ping" not in sent:
-                        msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
-                        notify = timer.get('notify_method', 'Silent')
-                        role_id = timer.get('role_id')
-                        
-                        content = msg
-                        if "Ping Role" in notify and role_id:
-                             content += f" <@&{role_id}>"
-                        elif "everyone" in notify:
-                             content += " @everyone"
-    
-                        try:
-                            if guild:
-                                db_ch_id = context_data["dashboards"][0].get("channel_id") if context_data.get("dashboards") else context_data.get("dashboard_channel_id")
-                                if db_ch_id:
-                                    ch = guild.get_channel(db_ch_id)
-                                    if ch: asyncio.create_task(ch.send(content))
-                            elif user:
-                                asyncio.create_task(user.send(content))
-                        except Exception as e:
-                            logger.error(f"5-min ping error: {e}")
-                        
-                        sent.append("5min_ping")
-                        timer["sent_reminders"] = sent
-                        guild_changed = True
+                # Removed hardcoded 5-minute ping to allow custom reminders to handle early alerts.
     
                 # --- Expiry Check ---
                 if current_time >= target_epoch:
@@ -3354,14 +3327,11 @@ async def check_timers():
                         channel = guild.get_channel(db_ch_id) if db_ch_id else None
                         if channel:
                              content = msg
-                             # Ping at expiry only if timer was too short for the 5-min warning
-                             target_epoch_expiry = timer.get("override_epoch", timer["end_epoch"])
-                             dur = target_epoch_expiry - timer.get("start_epoch", target_epoch_expiry - 301)
-                             if dur < 300:
-                                 if "Ping Role" in notify and role_id:
-                                      content += f" <@&{role_id}>"
-                                 elif "everyone" in notify:
-                                      content += " @everyone"
+                             # Always ping at expiry
+                             if "Ping Role" in notify and role_id:
+                                  content += f" <@&{role_id}>"
+                             elif "everyone" in notify:
+                                  content += " @everyone"
                              
                              asyncio.create_task(channel.send(content))
                     elif user:
