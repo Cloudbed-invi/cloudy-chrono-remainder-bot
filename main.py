@@ -3277,7 +3277,7 @@ async def check_timers():
     
                 # --- 5-Minute Early Tag ---
                 dur = target_epoch - timer.get("start_epoch", target_epoch - 301)
-                if dur >= 300:
+                if dur > 300:
                     if remain <= 300 and remain > -60 and "5min_ping" not in sent:
                         msg = f"⚠️ **Event Starting Soon:** `{timer['label']}` in {get_interval_str(remain)}!"
                         notify = timer.get('notify_method', 'Silent')
