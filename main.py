@@ -2127,15 +2127,16 @@ async def parse_natural_language_groq(text: str) -> dict:
 
     Example 5: "I have foundry on this friday voting starts on tuesday and ends on wednesday. repeats every 2 weeks."
     Output: {{"action": "set_cycle", "label": "Foundry", "description": "Foundry event cycle.", "time_string": "Tuesday", "timezone": "", "duration_string": "24h", "interval_string": "14d", "reminders_string": "", "target_role": "", "notify_method": "channel"}}
-
     Example 6: "Upcoming Bear Trap will be tomorrow 18:00 UTC but rest normal"
     Output: {{"action": "override", "label": "🐻 Bear Trap", "description": "", "time_string": "tomorrow 18:00", "timezone": "UTC", "duration_string": "", "interval_string": "", "reminders_string": "", "target_role": "", "notify_method": ""}}
+    
+    9. "Now" Handling: DO NOT output "now" for time_string if the user gives a duration (like "for the next 5 minutes"). In that case, time_string should be "5m".
     """
     
     try:
         completion = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="openai/gpt-oss-20b",
+            model="llama3-8b-8192",
             temperature=0.0,
             response_format={"type": "json_object"}
         )
