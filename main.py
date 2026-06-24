@@ -2069,11 +2069,17 @@ async def sync(ctx):
     except Exception as e:
         await ctx.send(f"❌ Sync failed: {e}")
 
-async def parse_natural_language_groq(text: str) -> dict:
+async def parse_natural_language_groq(text: str, user_tz_str: str = "UTC") -> dict:
     if not groq_client:
         raise ValueError("Groq API Key is not configured.")
         
-    current_time_str = datetime.now(timezone.utc).strftime("%A, %Y-%m-%d %H:%M UTC")
+    try:
+        import zoneinfo
+        user_tz = zoneinfo.ZoneInfo(user_tz_str) if user_tz_str.upper() != "UTC" else timezone.utc
+    except:
+        user_tz = timezone.utc
+        
+    current_time_str = datetime.now(user_tz).strftime("%A, %Y-%m-%d %H:%M %Z (Local Time)")
     
     prompt = f"""
     You are an AI assistant for a discord reminder bot specifically optimized for the mobile game "Whiteout Survival".
@@ -2098,6 +2104,8 @@ async def parse_natural_language_groq(text: str) -> dict:
     - "Arena": Label="🛡️ Arena Reset", default interval="24h", default early reminders="5m"
     - "Castle" or "Sunfire": Label="🏰 Castle Battle", default interval="28d", default early reminders="5h, 1h"
     - "SvS": Label="⚔️ SvS Battle", default interval="28d", default early reminders="5h, 1h"
+    
+    Colloquial Early Morning: If it is currently late at night (e.g. 9 PM) and the user asks for 'tomorrow at 12:30 AM', they almost always mean the night AFTER tomorrow (i.e. +27 hours, not +3 hours). Use your common sense and advance the date by one more day if their requested time is extremely soon but they said 'tomorrow'.
     
     Respond ONLY with a valid JSON object matching this structure (no markdown tags):
     {{
@@ -2158,7 +2166,8 @@ async def parse_natural_language_groq(text: str) -> dict:
 async def remind_slash(interaction: discord.Interaction, request: str):
     await interaction.response.defer(ephemeral=True)
     try:
-        parsed = await parse_natural_language_groq(request)
+        user_tz_str = get_user_tz_str(interaction.user.id)
+        parsed = await parse_natural_language_groq(request, user_tz_str)
         action = parsed.get("action", "create").lower()
         label = parsed.get("label", "Reminder")
         
@@ -2993,8 +3002,8 @@ async def on_message(message):
             try:
                 # We can't easily defer an on_message like an interaction, so we send a thinking message
                 msg = await message.reply("⏳ Thinking...")
-                parsed = await parse_natural_language_groq(content_no_mentions)
                 user_tz = get_user_tz_str(message.author.id)
+                parsed = await parse_natural_language_groq(content_no_mentions, user_tz)
                 
                 time_str = parsed.get("time_string", "")
                 if not time_str: raise ValueError("Could not determine a time.")
@@ -3050,7 +3059,8 @@ async def on_message(message):
                 msg = await message.channel.send(f"⏳ Processing time for **{cycle_name}**...")
                 
                 # Use Groq to parse the time
-                parsed = await parse_natural_language_groq(f"Set {cycle_name} to {message.content}")
+                user_tz = get_user_tz_str(message.author.id)
+                parsed = await parse_natural_language_groq(f"Set {cycle_name} to {message.content}", user_tz)
                 user_tz = get_user_tz_str(message.author.id)
                 time_str = parsed.get("time_string", "")
                 if not time_str: raise ValueError("Could not determine a time.")
