@@ -212,6 +212,25 @@ from db_turso import load_legacy_data as load_data, save_legacy_data as save_dat
 import asyncio
 db_lock = asyncio.Lock()
 
+# --- Sticky Dashboard Globals ---
+cached_dashboard_channels: set[int] = set()
+sticky_tasks: dict[int, asyncio.Task] = {}
+
+async def do_sticky(guild: discord.Guild, channel_id: int):
+    await asyncio.sleep(3.0) # Debounce delay
+    
+    async with db_lock:
+        data = load_data()
+        ctx_data = data.get(str(guild.id))
+        
+    if ctx_data:
+        db_channels = [d.get("channel_id") for d in ctx_data.get("dashboards", [])]
+        if channel_id in db_channels:
+            await update_dashboard(guild, ctx_data, resend=True)
+            
+    if sticky_tasks.get(channel_id) == asyncio.current_task():
+        del sticky_tasks[channel_id]
+
 # --- Autocomplete Helper ---
 async def timer_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     data = load_data()
@@ -1840,6 +1859,9 @@ async def update_dashboard(guild_or_user, data, resend: bool = False):
         db_msg_id = dashboard.get("message_id")
         db_name = dashboard.get("name", "Main Dashboard")
         
+        if db_channel_id:
+            cached_dashboard_channels.add(db_channel_id)
+            
         channel = guild_or_user.get_channel(db_channel_id)
         if not channel:
             dashboards_modified = True
@@ -2948,6 +2970,15 @@ async def show_event_slash(interaction: discord.Interaction, label: str):
 async def on_message(message):
     if message.author.bot: return
     
+    # --- STICKY DASHBOARD LOGIC ---
+    if message.guild and message.channel.id in cached_dashboard_channels:
+        # Debounce
+        if message.channel.id in sticky_tasks:
+            sticky_tasks[message.channel.id].cancel()
+        task = asyncio.create_task(do_sticky(message.guild, message.channel.id))
+        sticky_tasks[message.channel.id] = task
+        
+    
     # NLP Bot Mention Listener
     if bot.user in message.mentions:
         # Check if the message has "remind" or similar intent (optional but good)
@@ -3444,6 +3475,13 @@ async def on_ready():
 
     bot.add_view(DashboardView())
     await check_missed_events()
+    
+    # Preload cached dashboard channels
+    data = load_data()
+    for ctx_data in data.values():
+        for db in ctx_data.get("dashboards", []):
+            if db.get("channel_id"):
+                cached_dashboard_channels.add(db["channel_id"])
     
     # Cleanup Discord Events without Role Pings
     logger.info("Cleaning up Discord Scheduled Events without Role Pings...")
